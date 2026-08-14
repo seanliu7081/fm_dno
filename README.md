@@ -24,12 +24,12 @@ Two conventions worth internalising up front:
 oat/
   common/       replay buffer, checkpointing, hydra resolvers, video/json logging
   config/       all Hydra experiment configs (train_*.yaml) + task/ groups
-  dataset/      ZarrDataset, ZarrDatasetWithPastAction
+  dataset/      ZarrDataset, ZarrDatasetWithPastAction, ZarrDatasetWithPrevWindow
   env/          LIBERO env wrapper + hdf5 -> zarr conversion
   env_runner/   parallel sim rollout runner
   model/        act / autoregressive / diffusion backbones, EMA, schedulers
   perception/   observation encoders (robomimic ResNet, state, fused)
-  policy/       the 7 policies below
+  policy/       the 8 policies below
   tokenizer/    the OAT tokenizer family (encoder / decoder / FSQ / SO(3) aug)
   workspace/    Hydra workspaces = training loops (entry points via `_target_`)
 scripts/        data conversion, training entry point, sim eval
@@ -277,6 +277,31 @@ HYDRA_FULL_ERROR=1 MUJOCO_GL=egl accelerate launch \
 Pair it with a `train_oattok_so3aug` checkpoint for the full method, or with `train_oattok` to
 isolate the enriched-past contribution.
 
+**`train_past2next_self_past`** — same architecture and loss as `train_past2next`; the only change
+is *where the 7 past actions come from during training*. Instead of the dataset's ground truth, the
+policy re-runs itself on the observation window one execution stride back and keeps the past buffer
+that run would have left behind — the exact quantity it conditions on at rollout. This closes the
+train/rollout mismatch at depth 1 (the inner call still uses ground-truth past). Requires the
+`libero10_with_prev_window` task group, which adds `prev_obs` / `prev_past_action` to each sample.
+
+```bash
+HYDRA_FULL_ERROR=1 MUJOCO_GL=egl accelerate launch \
+    --num_machines 1 --multi_gpu --num_processes 4 \
+    scripts/run_workspace.py \
+    --config-name=train_past2next_self_past \
+    training.num_epochs=5001 \
+    training.num_demo=500 \
+    task.policy.lazy_eval=false \
+    policy.action_tokenizer.checkpoint=/abs/path/to/output/<tok-run>/checkpoints/ep-0900_mse-0.003.ckpt
+```
+
+The extra generation costs ~1.47x per step (batch 64, bf16, one RTX 4090). Knobs:
+`policy.self_past_p` (1.0 = always self-generated, lower mixes with ground truth,
+scheduled-sampling style), `policy.self_past_warmup_steps` (default 500 — ground-truth past first,
+so the policy is not conditioned on a randomly-initialised model's output), and
+`policy.self_past_temperature` / `policy.self_past_topk` (`null` reuses the policy's own sampling
+settings, which is what rollout does).
+
 ### 3.4 Continuous baselines (no tokenizer)
 
 Each is one command; swap `--config-name`. None takes a tokenizer checkpoint.
@@ -327,6 +352,7 @@ HYDRA_FULL_ERROR=1 MUJOCO_GL=egl accelerate launch \
 | `train_oattok_so3aug` | `OATTokSO3Aug` | 16 / — | — | `tokenizer/libero/libero10` | — |
 | `train_oatpolicy` | `OATPolicy` | 16 / 8 | 2 | `policy/libero/libero10` | **yes** |
 | `train_past2next` | `Past2NextPolicy` | 16 / 8, `past_n=7` | 2 | `policy/libero/libero10_with_past` | **yes** |
+| `train_past2next_self_past` | `Past2NextSelfPastPolicy` | 16 / 8, `past_n=7` | 2 | `policy/libero/libero10_with_prev_window` | **yes** |
 | `train_diffpolicy` | `DiffusionTransformerPolicy` | 16 / 8 | 2 | `policy/libero/libero10` | no |
 | `train_flowpolicy` | `FlowPolicy` | 16 / 8 | 2 | `policy/libero/libero10` | no |
 | `train_flowpolicy_with_enriched_past` | `FlowPolicyWithEnrichedPast` | 16 / 8, `past_n=7` | 2 | `policy/libero/libero10_with_past` | no |
@@ -404,6 +430,11 @@ past. `train_flowpolicy_with_enriched_past` keeps the enriched past but replaces
 bottleneck with flow matching — the ablation that isolates the tokenizer. Pairing
 `train_past2next` with a `train_oattok_so3aug` checkpoint gives the full method; pairing it with
 `train_oattok` isolates the SO(3) augmentation.
+
+**Exposure bias.** Training reads `past_action` from the dataset, but at rollout the past window is
+the policy's own output, so errors there are off-distribution. `train_past2next_self_past`
+(`oat/policy/past2next_self_past.py`) is the variant that trains on the self-generated past
+instead; see §3.3.
 
 ---
 
