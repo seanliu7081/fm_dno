@@ -122,17 +122,54 @@ def main() -> None:
     x = raw * so2_scale + so2_offset      # everything below lives in the equivariant space
 
     # ---- energy ----------------------------------------------------------------------
+    # GATE G4 must be read on the RAW actions, not the normalized ones.
+    #
+    # With vector_mode='rms' the SO(2) normalizer sets every vector block to unit
+    # per-coordinate RMS, so the normalized per-block energies are equal BY CONSTRUCTION
+    # and the < 0.05 threshold is unreachable no matter what the data looks like. Reading
+    # the gate off the normalized numbers silently guarantees a pass. Both are printed
+    # below; the gate fires on the raw share.
     print("\n" + "=" * 78)
-    print("2  PER-BLOCK ENERGY  (after SO(2) normalization)")
+    print("2  PER-BLOCK ENERGY  -- raw vs normalized")
     print("=" * 78)
-    energy = vector_energy_fraction(x, spec)
-    for k, v in energy.items():
-        print(f"  {k:<28}{v:8.4f}")
-    report["energy"] = energy
-    v1 = energy.get("vec1_energy_frac", 0.0)
-    if v1 < 0.05:
-        print(f"\n  !! (wx,wy) carries {v1:.1%} of chunk energy. The coupling is effectively")
-        print(f"     translation-only. Use SO2ChunkSpec.translation_only() and say so.")
+    energy_raw = vector_energy_fraction(raw, spec)
+    energy_norm = vector_energy_fraction(x, spec)
+    print(f"  {'block':<24}{'RAW':>10}{'normalized':>14}   (gate reads RAW)")
+    for k in energy_raw:
+        print(f"  {k:<24}{energy_raw[k]:10.4f}{energy_norm.get(k, float('nan')):14.4f}")
+
+    flat_raw = raw.reshape(-1, spec.action_dim)
+    rms = [float(flat_raw[:, d].pow(2).mean().sqrt()) for d in range(spec.action_dim)]
+    print("\n  per-dim raw RMS: " + "  ".join(
+        f"{n}={v:.4f}" for n, v in zip(
+            ("dx", "dy", "dz", "wx", "wy", "wz", "grip")[: spec.action_dim], rms)))
+
+    report["energy"] = energy_norm            # kept under the original key for compatibility
+    report["energy_raw"] = energy_raw
+    report["energy_normalized"] = energy_norm
+    report["raw_per_dim_rms"] = rms
+
+    print("\n" + "-" * 78)
+    print("  GATE G4  (threshold: raw vec1_energy_frac < 0.05)")
+    v1_raw = energy_raw.get("vec1_energy_frac", 0.0)
+    v1_norm = energy_norm.get("vec1_energy_frac", 0.0)
+    report["G4_raw_vec1_energy_frac"] = v1_raw
+    report["G4_fires"] = bool(v1_raw < 0.05)
+    if v1_raw < 0.05:
+        print(f"  !! FIRES: (wx,wy) carries {v1_raw:.2%} of RAW chunk energy "
+              f"(normalized reads {v1_norm:.4f}).")
+        print("     The rotation block is near-inert in physical units, and the rms")
+        print("     normalizer then amplifies it to parity. Pick ONE policy and apply it")
+        print("     to EVERY arm including the iid control; record it in RUNLOG.md:")
+        print("       (b) policy.action_spec.block_weights=[1.0,0.0]   <- recommended")
+        print("           translation-only heading/assignment; normalizer untouched, so an")
+        print("           existing iid control stays valid.")
+        print("       (a) policy.normalizer_vector_mode=global_rms")
+        print("           keeps blocks in raw proportion, but CHANGES the normalizer and so")
+        print("           needs its own iid control re-run.")
+        print("       (c) keep the default and record the caveat in the writeup.")
+    else:
+        print(f"  does not fire: raw vec1_energy_frac = {v1_raw:.4f} >= 0.05")
 
     # ---- headings --------------------------------------------------------------------
     print("\n" + "=" * 78)

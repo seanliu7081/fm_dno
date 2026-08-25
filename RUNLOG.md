@@ -542,6 +542,347 @@ rather than by the coupling. **From Phase 3 onward, report per-task success rate
 arm, not just the aggregate.** The numbers are already in each `eval_log.json`; this costs
 nothing but changes what can honestly be concluded.
 
+---
+
+# PHASE 2.5 — triage before committing to Phase 3
+
+Following `PHASE_2.5_PLAN.md`, which supersedes `EXPERIMENT_PLAN.md` §5 until its gates
+resolve. Repo renamed `past2next_clean` → **`fm_dno`**; all artifacts moved intact.
+
+## 2026-08-24 — §1 corrections
+
+**The "refreshed package" referenced by §1 does not exist.** `orbit_fm_dno/` is still the
+original 2026-08-21 drop: no `paired_task_compare.py`, no `global_rms`, no `descent_limit`,
+no `--w-descent`. All seven changes were therefore **written here** rather than copied.
+
+Before writing them, each was checked against the training path, because two ~30 h runs were
+about to start: `global_rms` is opt-in (default stays `rms`), the audit/diagnostics/paired
+scripts are standalone, the histogram gating is a no-grad buffer write with no RNG draw, and
+`descent_limit` is DNO-eval only. **None alters a training trajectory**, so the GPUs were
+started first and the corrections written while they ran.
+
+| file | change |
+|---|---|
+| `scripts/paired_task_compare.py` | **new** — paired per-task statistics (G15) |
+| `scripts/libero_heading_audit.py` | G4 reads **raw** block energy; prints raw vs normalized + per-dim raw RMS |
+| `scripts/report_coupling_diagnostics.py` | warning guard now tests `coupling['mode']`, not a literal string |
+| `oat/policy/flow_policy_orbit.py` | `source_heading_hist` accumulates only for `mode in (rot, perm_rot)` |
+| `oat/symmetry/normalizer.py` | new `vector_mode='global_rms'` — one scale pooled over all vector coords |
+| `oat/dno/task_losses.py` | new `descent_limit` + `max_descent` field, wired into `CompositeTaskLoss` |
+| `scripts/eval_orbit_dno_libero.py` | `--w-descent` / `--max-descent`; `--w-table` now defaults **0**; `--table-z` default 0.82 → 0.44 |
+
+**Gate G0 — passes, but the literal test no longer applies.** The drop-in was committed in
+`fb6d6b1` / `f4cabea`, so our files are now *tracked*; editing them shows ` M`, not `??`.
+The invariant that matters is the original repo, verified directly:
+
+```bash
+git diff --name-only 15b93ee -- <every §0.1 protected path> oat/config/task/policy/libero/
+#  -> empty. Original repo byte-identical.
+```
+
+The six ` M` entries are exactly the plan's six. **Use the `git diff` form from now on**;
+`git status | grep -v '^??'` is no longer a valid G0 check for this repo.
+
+**Gate G1 — re-passes unchanged** after the corrections: min-max 2.383e-01, SO(2) block
+3.484e-08, IrrepAdam 1.608e-07, plain Adam 4.791e-01. → `output/logs/selftest_phase25.txt`
+
+`descent_limit` verified to do what it claims — identical chunk at eef z = 0.50 / 0.95 / 1.20:
+
+```
+descent_limit(0.15)   [0.0,     0.0, 0.0]      benign chunk, height-agnostic
+  (diving chunk)      [2.0475, 2.0475, 2.0475] active and EQUAL on both scene families
+table_clearance(0.82) [1.5449,  0.0, 0.0]      punishes the LOW scene only  <- the bug
+table_clearance(0.44) [0.0,     0.0, 0.0]      inert everywhere             <- the other horn
+```
+
+## §2 — corrected audit → **Gate G4′**
+
+`$PY scripts/libero_heading_audit.py --zarr data/libero/libero10_N500.zarr --horizon 16
+-o output/exp/audit_libero10_v2.json` (40 s)
+
+| block | **RAW** | normalized |
+|---|---|---|
+| `vec0 (dx,dy)` | 0.1553 | 0.3835 |
+| **`vec1 (wx,wy)`** | **0.0034** | 0.3835 |
+| `dz` | 0.0998 | 0.0296 |
+| `wz` | 0.0061 | 0.0116 |
+| gripper | 0.7354 | 0.1918 |
+
+`per-dim raw RMS: dx=0.2822 dy=0.3627 dz=0.3684 wx=0.0401 wy=0.0555 wz=0.0910`
+
+The two normalized figures being **identical** is the defect itself: `rms` equalises blocks
+by construction, so the old gate could never fire. On raw actions it fires decisively —
+0.34 % vs a 5 % threshold. Reproduces the hand-computed §7.1 values.
+
+**Gate G4′ DECISION: option (b), `policy.action_spec.block_weights=[1.0,0.0]`**, applied to
+**every** arm from here on including the iid control. Rationale: it changes only the coupling
+cost, so P1 remains an exact control and Phase 2's result stays valid; `global_rms` would
+change the normalizer and reintroduce the very confound Phase 2 was run to eliminate.
+Verified semantics: complex width 32 → 16 (translation-only heading/assignment) while
+`rotate_chunk` still rotates **both** blocks; heading equivariance under the weighted spec
+2.38e-07.
+
+## §3 — **Gate G15**, paired re-analysis of P0 vs P1
+
+→ `output/exp/paired_P0_vs_P1.{json,txt}`
+
+```
+aggregate P0            0.1860
+aggregate P1            0.2013
+paired mean delta      +0.0153
+paired sd over tasks    0.2056
+paired stderr           ±0.0650    <-- THE RESOLVABLE EFFECT SIZE
+paired t (9 dof)        +0.24    two-sided p 0.819
+sign test               p 0.754  (4 of 10 tasks positive)
+mean |per-task delta|   0.1580    reshuffle ratio 10.3x
+MDE at p<0.05, n=10     0.1470    projected at 3 seeds  0.0849
+```
+
+Hand-rolled t-test and sign test cross-checked against `scipy`: identical to 4 decimals.
+Reproduces every figure the plan quotes.
+
+**AMENDED GATE G6 VERDICT.** The ±0.0121 recorded earlier was the *within-arm repeat*
+stderr — it measures rollout stochasticity at fixed weights and omits the task-to-task
+variance that dominates here, understating the true uncertainty by ~5×. Corrected:
+
+* defensible: **"the SO(2) normalizer carries no measurable success-rate cost"**
+  (|Δ| < 0.147 at this resolution);
+* **not** defensible: "P1 is better than P0" — t = +0.24, p = 0.82, sign test p = 0.75.
+
+P0 remains the reference baseline. **No aggregate delta is to be quoted without its paired
+stderr from here on**, and no coupling effect below ~0.15 is detectable at one seed
+(~0.085 at three).
+
+## §4/§5 — Tracks A and B launched
+
+Two bugs in the plan's own commands, both caught before committing GPU time:
+
+1. **`policy.coupling.kappa=.inf` crashes.** Through Hydra's CLI grammar it arrives as the
+   *string* `'.inf'`; `build_coupling` does `float('.inf')` → `ValueError`. The YAML default
+   is already float `inf`. Use `kappa=inf` or omit it. Verified both give `inf`.
+2. **Track B needs `MUJOCO_GL=egl`.** `lazy_eval=false` builds an env runner; the plan's
+   command omits it (README §1.4).
+
+**OOM incident.** The first attempt ran both tracks as written and Track A was killed
+(exit 137) during its dataset load. Cause is new to this phase: Track B's `lazy_eval=false`
+forks 10 MuJoCo env workers — Phase 2 never did — pushing the pair past 62 GB. Measured
+footprints: Track A **19 GB**; Track B **40 GB** with 10 envs (the per-process RSS sums to
+229 GB but the forks are copy-on-write, so real usage is far lower).
+
+`ZarrDataset` hardcodes the in-memory store and does not expose `backend`/`store`, and
+`oat/dataset/zarr_dataset.py` is §0.1-protected — so the disk-backed fix is unavailable.
+
+Resolved with two safeguards rather than serialising the runs (which would have cost ~62 h
+instead of ~37 h):
+
+* `task.policy.env_runner.n_parallel_envs` **10 → 5** on Track B (halves the forks).
+  Coverage is unchanged — `n_test=50` over 10 tasks still gives 5 episodes/task — but the
+  task↔seed pairing differs from a 10-env run, so P1_curve's absolute SR is comparable
+  *within* its own curve, which is all G14 needs. Rollout overhead ~4 h → ~8 h.
+* Track B launched with **`oom_score_adj=800`** (inherited by its children), so if memory is
+  exhausted the OOM killer takes Track B and the *decisive* Track A survives.
+
+Steady state with both resident: **47 GB used, 15 GB free**; Track A `adj=0`, Track B `adj=800`.
+
+| track | GPU | command | status |
+|---|---|---|---|
+| **A — P4_rot_heading** | 0 | `mode=rot align=heading kappa=inf block_weights=[1.0,0.0]` | running, ~29 h |
+| **B — P1_curve** | 1 | `mode=iid block_weights=[1.0,0.0] lazy_eval=false rollout_every=50 n_test=50 n_parallel_envs=5 n_test_vis=0 topk.k=5` | running, ~37 h |
+
+Gates pending: **G13** (steering gain, `P4_rot_heading/seed42/diag.json`) and **G14** (SR-vs-epoch
+curve + working top-k, `P1_curve/seed42/`). Then the §6 decision matrix.
+
+## 2026-08-24 — **Gate G14: the curve is FLAT. Ceiling, not undertraining.**
+
+Rollout points from `P1_curve/seed42/logs.json` (`n_test=50`, so ±0.057 binomial per point):
+
+```
+epoch     0   SR 0.000
+epoch    50   SR 0.040
+epoch   100   SR 0.260
+epoch   150   SR 0.220
+epoch   200   SR 0.140
+epoch   250   SR 0.180
+epoch   300   SR 0.220
+```
+
+**Correction to an earlier reading in this log.** A first pass compared the maximum (0.260 @
+epoch 100) against the mean of the same five points divided by sqrt(n) and called it "2.7
+sigma, a real peak". That is wrong twice: it tests the maximum against a distribution it
+belongs to (selection bias), and it uses the standard error *of the mean* where the
+*per-point* binomial noise is the correct yardstick. Redone properly:
+
+```
+post-epoch-100 points        [0.26, 0.22, 0.14, 0.18, 0.22]   pooled p = 0.204
+expected per-point noise      0.0570   (binomial, n=50)
+observed sd across points     0.0456   <- SMALLER than pure sampling noise
+chi2 for constant p           2.56, df=4, p=0.634
+max vs mean-of-rest           1.2 per-point sigma  (max of 5 draws: expected ~1.2)
+linear trend, epoch>=100      slope -2.4e-04/epoch, p=0.486
+```
+
+**No peak, no decline, no trend.** The scatter is smaller than binomial noise alone, so a
+single constant success rate explains the data completely. Independently corroborated by
+Phase 2: `P1_norm_only` ran the full 1001 epochs and finished at **0.2013** over 1500
+episodes — indistinguishable from this plateau of 0.204.
+
+**GATE G14 VERDICT: row 3 — "flat near 0.19 from early on; the config is at its ceiling."**
+Consequences:
+
+* **The budget question is settled: raising `EPOCHS` will not help.** The open decision
+  carried since Phase 2 is closed, and closed against more compute.
+* The ceiling is reached by **epoch ~100**, so the 1001-epoch budget is ~10x more than this
+  configuration can use. Phase 2's two 29 h runs could each have been ~3 h.
+* Phase 2 did **not** report post-peak checkpoints — 0.186/0.201 sit on the plateau, so
+  those numbers stand as representative.
+* The bottleneck is elsewhere. Per `PHASE_2.5_PLAN.md` §5 the first suspects are the scalar
+  `task_uid` conditioning for a 10-task multitask policy, and `prompt`, which is present in
+  the zarr but absent from `libero10.yaml`'s `obs_keys`. Adding it requires a **new** task
+  config file, never an edit (Gate G0).
+
+**Top-k selection now works** — `ep-0100_sr-0.260.ckpt` … `ep-0300_sr-0.220.ckpt` are being
+written, the first time the manager has ever fired in this project (under `lazy_eval: true`
+it never could). **But do not naively adopt the top-k checkpoint here.** On a flat curve,
+selecting the maximum selects the luckiest binomial draw, not a better model: 0.260 is
+1.2 sigma above a plateau of 0.204, exactly the expected maximum of five draws, and
+re-evaluating it on 500 episodes will regress toward ~0.20. The plan's G14 row-1 remedy
+("re-evaluate at the peak epoch") applies to a curve with a *real* peak; applying it to this
+one would be a winner's-curse error and would inflate every arm that got a lucky draw.
+
+## 2026-08-24 — **Gate G13 (preliminary): the mechanism TRANSFERS. gain = 0.99**
+
+Run on Track A's rolling `latest.ckpt` at **epoch ~330 of 1001**, not the final checkpoint —
+possible because the steering gain is a property of the coupling measured on validation
+chunks, with no rollouts and no sensitivity to the operating point. Executed with
+`oom_score_adj=1000` so the probe itself would be sacrificed before either training run;
+both tracks survived.
+
+| metric | P0 @1001 | P1 @1001 | **P4 @~330** |
+|---|---|---|---|
+| `orbit_steering_gain` | −0.00000 | −0.00000 | **0.99000** |
+| `orbit_phase_consistency` | 0.05259 | 0.05467 | **0.83646** |
+| `src_orbit_eq_rel` | 0.56720 | 1.10952 | 0.88675 |
+| `heading_MAE` | 0.39026 | 0.62267 | 1.37418 |
+| `action_mse_N1` / `N10` | 0.03824 / 0.04476 | 0.02731 / 0.03045 | 0.06812 / 0.08239 |
+| `gen_heading_R1` / `gt_heading_R1` | 0.48050 / 0.47012 | 0.11184 / 0.07717 | 0.14509 / 0.14887 |
+| `few_step_gap_N1` / `N4` | 0.19540 / 0.08752 | 0.20833 / 0.07914 | 0.39943 / 0.13307 |
+| `straightness` | 1.74761 | 4.07690 | 6.49047 |
+
+**GATE G13 VERDICT: top band (>= 0.7). The SO(2) orbit coupling makes the noise phase
+control the chunk heading on real LIBERO-10 data.** Two independent statistics agree:
+the gain is 0.99 (ideal 1.0) and the phase consistency rises 0.053 → 0.836 (ideal 1.0).
+Both controls read essentially zero, so the metric was calibrated and the reading is real.
+This is the synthetic study's central claim reproduced on robot data, and per §4 it licenses
+Phase 6 and is worth reporting on its own.
+
+**The delegation trade-off appears exactly as predicted, in both directions at once.**
+§4 warns: "if the gain is high and these did *not* worsen, be suspicious — the delegation
+mechanism predicts both together." Measured against P1: `src_orbit_eq_rel` **falls**
+(1.110 → 0.887, predicted to drop) while `heading_MAE` (0.623 → 1.374) and `action_mse_N10`
+(0.030 → 0.082) **worsen**. The policy has stopped inferring heading from the observation
+and reads it off the noise phase — which is the contract, and what Phase 6 exists to repay.
+
+**Caveats, stated because they bound the claim:**
+
+1. **Preliminary checkpoint.** P4 is at epoch ~330; P0/P1 are at 1001. A *high* gain is
+   decisive-positive — undertraining cannot manufacture 0.99 out of an uncoupled 0.00 — but
+   the *magnitudes* of the worsened metrics are partly confounded with training progress.
+2. **The transport half is not yet supported.** `straightness` (6.49 vs P1's 4.08) and
+   `few_step_gap_N1` (0.399 vs 0.208) are *worse*, not better, where §4 expected "comparable
+   to P1, improvement here is the transport half of the claim". This may be the epoch
+   mismatch; the fair comparison needs P4's final checkpoint. Do not claim the transport
+   half on this evidence.
+3. Re-run `report_coupling_diagnostics.py` on the final P4 checkpoint before publishing any
+   of these numbers.
+
+### 2026-08-24, later — **G14 VERDICT RETRACTED. The curve is not flat.**
+
+The epoch-350 rollout came in at **SR 0.400**, and it breaks the constant-rate model that
+the "ceiling" verdict above rested on:
+
+```
+epochs 100-300 (what the verdict was based on)   p_bar=0.204  chi2= 2.56 df=4  p=0.634  consistent
+epochs 100-350 (with the new point)              p_bar=0.237  chi2=11.16 df=5  p=0.048  REJECTED
+
+P(X >= 20/50 | p = 0.204)                = 0.00121  one-sided
+P(at least one of 6 draws this extreme)  = 0.0072
+linear trend epoch>=100                  = +4.2e-04/epoch, p=0.382 (not yet significant)
+```
+
+A 0.400 point has ~1-in-800 probability of arising from the 0.204 plateau, and ~0.7 % even
+after allowing for six chances to be surprised. It is very unlikely to be sampling noise.
+
+**Therefore the G14 verdict recorded above ("row 3, ceiling") is withdrawn, and with it the
+two conclusions drawn from it:** that the budget question is closed against more compute,
+and that Phase 3 is not licensed. Both are **undecided again**. The curve is currently
+consistent with row 2 ("still climbing at 1001, genuinely undertrained") or with a plateau
+plus one real excursion; the linear trend is still not significant (p=0.38) because the
+epoch-150-to-300 points are noisy, so more points are required to separate the two.
+
+What survives unchanged: **Gate G13 is unaffected.** The steering gain is measured offline
+on validation chunks with no rollouts, so it is independent of the operating point and of
+this curve entirely — that independence is exactly why `PHASE_2.5_PLAN.md` §0 called Track A
+the decisive one.
+
+**Operational consequence: Track B must run on.** Stopping it early had been proposed here
+on the strength of the flat reading; the very next point it produced is the one that
+overturned that reading. It continues to 1001.
+
+Method note for the rest of this project: five rollout points at `n_test=50` were not enough
+to certify a shape. A chi-square consistency test can only fail to reject; it never
+establishes flatness, and treating "consistent with constant" as "is constant" is what went
+wrong. Any future curve claim needs either more points, larger `n_test`, or both.
+
+### 2026-08-24, later still — the rise is real, and it exposes a level discrepancy
+
+Epoch 400 came in at 0.360, a second consecutive high point. Pooling episodes rather than
+averaging noisy per-point rates:
+
+```
+epochs 100-300     51/250 = 0.204
+epochs 350-400     38/100 = 0.380
+two-proportion z = 3.42,  p = 0.00064      Fisher exact p = 0.00103
+linear trend epoch>=100: +5.3e-04/epoch, p = 0.150 (masked by the noisy middle)
+```
+
+**The rise is real.** Success nearly doubled after epoch 300. The "ceiling at ~0.20" reading
+is dead, and the retraction above stands confirmed rather than merely precautionary.
+
+**Open puzzle — do not treat Phase 2's absolute numbers as settled.** `P1_norm_only` is the
+same configuration and it measured **0.2013 at epoch 1001** over 1500 episodes, while this
+curve is at ~0.38 by epoch 400. Three candidate explanations, not yet separated:
+
+1. **Episode-set difficulty.** This curve uses 50 episodes (seeds 1000-1049,
+   `n_parallel_envs=5`); the Phase 2 eval used 500 (seeds 1000-1499, `n_parallel_envs=20`),
+   a different and far larger set. Levels from the two protocols are **not** directly
+   comparable.
+2. **Run-to-run variance.** `PHASE_2.5_PLAN.md` §5 anticipated this: enabling rollouts
+   consumes the global RNG, so `P1_curve` is a second sample at the same budget, not a
+   reproduction.
+3. **A genuine peak-then-decline between epoch 400 and 1001**, which would mean Phase 2 did
+   report post-peak checkpoints after all.
+
+**Cheap decisive test, queued for when a GPU frees up:** evaluate the *finished*
+`P1_norm_only/seed42/checkpoints/latest.ckpt` under this curve's exact protocol
+(`--n-test 50 --n-parallel-envs 5`). It loads no dataset, so it is light. If it returns
+~0.38, explanation 1 holds and the two protocols simply measure different things. If it
+returns ~0.20, explanations 2/3 are live and the peak-then-decline possibility is real.
+Until that is run, **quote no absolute success rate without naming its protocol.**
+
+## Where §6's decision matrix lands
+
+**Undetermined, pending G14.** `G13 >= 0.7` is settled, which fixes the *row* of §6's matrix
+but not the column:
+
+| G13 | G14 outcome | §6 cell |
+|---|---|---|
+| **>= 0.7 (settled)** | operating point fixable / still climbing | **Best case** — re-baseline at the new budget and selection, then run Phase 3 (P1, P2, P3, P4) **and** Phase 6. The steering result is publishable on its own. |
+| **>= 0.7 (settled)** | ceiling at ~0.20 | Run **Phase 6 only** on the P4 checkpoint; report the transport claim as unresolved at this operating point, with the ±0.065 paired stderr as the reason. |
+
+An earlier revision of this section committed to the second row. That was premature — it
+rested on the retracted flat reading. **No Phase 3 decision is to be made until Track B's
+curve resolves.**
+
 ## Decision required before Phase 2 training starts
 
 **Gate G4 / `block_weights`.** By the letter of §3 the gate does not fire (0.3835 > 0.05)

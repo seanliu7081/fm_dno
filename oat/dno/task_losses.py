@@ -122,6 +122,42 @@ def table_clearance(
     return (torch.relu(z_min - p[..., 2]) ** 2).sum(-1)
 
 
+def descent_limit(
+    a: torch.Tensor,
+    eef_pos: torch.Tensor,
+    max_descent: float = 0.15,
+    trans_gain: float = TRANS_GAIN_DEFAULT,
+) -> torch.Tensor:
+    """Penalise the chunk driving the end-effector more than ``max_descent`` below its
+    CURRENT height. A *relative* clearance floor.
+
+    WHY THIS REPLACES ``table_clearance`` ON LIBERO-10
+    --------------------------------------------------
+    ``table_clearance`` needs one absolute plane ``z_min``. Measured on
+    ``libero10_N500.zarr`` the demonstrated end-effector height is **bimodal**, with an
+    empty gap at 0.815-0.889 and the ten tasks splitting five/five:
+
+        low  group  eef z in [0.446, 0.781]      (all five LIVING_ROOM tasks)
+        high group  eef z in [0.910, 1.332]      (four KITCHEN + STUDY)
+
+    So no scalar is both safe and active. The plan's placeholder 0.82 lies *above* the
+    maximum height of every low-group task, i.e. it would penalise **every demonstrated
+    step** of half the benchmark. Pushing it below the global 1st percentile (0.448) makes
+    it safe but identically zero for the entire high group -- an inert term carrying the
+    largest weight in the Tier-0 objective.
+
+    Anchoring to the current height sidesteps the choice: the penalty is by construction
+    identical at eef z = 0.50, 0.95 and 1.20, so one setting is simultaneously safe and
+    active on both scene families. It encodes "do not dive" rather than "stay above a
+    plane", which is the constraint actually wanted.
+
+    Note it is SO(2)-invariant (it reads only the z channel), unlike ``workspace_box``.
+    """
+    p = rollout_positions(a, eef_pos, trans_gain)                 # (B, H, 3)
+    floor = eef_pos[:, 2].unsqueeze(-1) - float(max_descent)      # (B, 1)
+    return (torch.relu(floor - p[..., 2]) ** 2).sum(-1)
+
+
 def gripper_decisiveness(a: torch.Tensor, dim: int = 6) -> torch.Tensor:
     """Push the gripper channel toward a committed +/-1 rather than an ambiguous middle.
 
@@ -198,6 +234,7 @@ class CompositeTaskLoss:
     workspace_lo: Optional[Sequence[float]] = None
     workspace_hi: Optional[Sequence[float]] = None
     table_z: Optional[float] = None
+    max_descent: float = 0.15
     obstacle_margin: float = 0.02
     last_terms: Dict[str, float] = field(default_factory=dict)
 
@@ -221,6 +258,10 @@ class CompositeTaskLoss:
             )
         if w.get("table") and self.table_z is not None:
             terms["table"] = table_clearance(a, ctx["eef_pos"], self.table_z, self.trans_gain)
+        if w.get("descent") and ctx.get("eef_pos") is not None:
+            terms["descent"] = descent_limit(
+                a, ctx["eef_pos"], self.max_descent, self.trans_gain
+            )
         if w.get("obstacles") and ctx.get("centers") is not None:
             terms["obstacles"] = sphere_obstacles(
                 a, ctx["eef_pos"], ctx["centers"], ctx["radii"],

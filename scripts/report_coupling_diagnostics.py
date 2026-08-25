@@ -170,7 +170,13 @@ def main(checkpoint, output, device, batch_size, n_angles):
         if k in report:
             print(f"{k:<28}{report[k]:.5f}")
     print(f"\nwrote {out}")
-    if abs(report.get("orbit_steering_gain", 0.0)) < 0.2 and report["coupling"] != "iid(baseline)":
+    # A near-zero gain is only a problem on an arm that actually applies a coupling.
+    # The old guard compared against the literal string "iid(baseline)", so it fired on
+    # every orbit-config checkpoint -- including mode=iid, where a zero gain is REQUIRED.
+    _c = report.get("coupling")
+    _mode = _c.get("mode", "iid") if isinstance(_c, dict) else "iid"
+    _is_coupled = _mode in ("rot", "perm", "perm_rot")
+    if abs(report.get("orbit_steering_gain", 0.0)) < 0.2 and _is_coupled:
         print("\n!! steering gain is near zero on a coupled checkpoint. Stage 1 of DNO will")
         print("   behave as best-of-K resampling. Check mode/align/kappa before running DNO.")
 

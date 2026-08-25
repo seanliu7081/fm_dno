@@ -234,6 +234,14 @@ class OrbitFlowPolicy(FlowPolicy):
 
     @torch.no_grad()
     def _accumulate_source_headings(self, z0: torch.Tensor) -> None:
+        # Only a rotation-APPLYING coupling induces a source heading law worth matching.
+        # Accumulating for every mode made an iid checkpoint carry a populated histogram,
+        # which defeated both the EXPERIMENT_PLAN S6 assertion and the --inference-prior
+        # guard in eval_orbit_dno_libero.py: neither could tell P5 was being run on an arm
+        # that never deformed its prior. For iid/perm the induced law IS the isotropic one,
+        # so an empty histogram is the honest record.
+        if self.coupling.mode not in ("rot", "perm_rot"):
+            return
         theta, _ = chunk_heading(z0.detach().float(), self.action_spec)
         theta = torch.remainder(theta, 2 * math.pi)
         n_bins = self.source_heading_hist.numel()

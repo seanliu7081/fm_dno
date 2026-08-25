@@ -138,8 +138,9 @@ def so2_scale_offset_from_stats(
     observed block lands inside the unit disc, at the cost of being driven by outliers.  Use
     ``fit_so2_action_scale_offset`` on the raw actions if you want a true quantile.
     """
-    if vector_mode not in ("rms", "absmax"):
-        raise ValueError(f"vector_mode must be 'rms' or 'absmax', got {vector_mode}")
+    if vector_mode not in ("rms", "absmax", "global_rms"):
+        raise ValueError(
+            f"vector_mode must be 'rms', 'absmax' or 'global_rms', got {vector_mode}")
     mean = torch.as_tensor(stats["mean"]).float()
     std = torch.as_tensor(stats["std"]).float()
     lo = torch.as_tensor(stats["min"]).float()
@@ -148,7 +149,31 @@ def so2_scale_offset_from_stats(
     scale = torch.ones(spec.action_dim)
     offset = torch.zeros(spec.action_dim)
 
+    # 'global_rms': ONE scale shared by every vector block, fitted on the pooled second
+    # moment of all frequency-1 coordinates.
+    #
+    # Why it exists: per-block 'rms' gives each block unit per-coordinate RMS, which makes
+    # the post-normalization block energies equal BY CONSTRUCTION regardless of the data.
+    # On LIBERO-10 that lifts (wx,wy) -- 0.34% of raw action energy -- to parity with
+    # (dx,dy), so the coupling lets a near-inert channel vote equally on the chunk heading.
+    # A single shared scale preserves the raw proportion between blocks while remaining
+    # exactly rotation-commuting (a scalar multiple of the identity on each block, offset 0).
+    #
+    # NOTE: this CHANGES the normalizer, so an iid control trained under 'rms' is no longer
+    # the matched control for an arm trained under 'global_rms'. Prefer block_weights for a
+    # coupling-only change; use this only with its own re-run control.
+    if vector_mode == "global_rms":
+        idx = list(spec.vector_index)
+        second = sum(float(mean[d] ** 2 + std[d] ** 2) for d in idx) / max(len(idx), 1)
+        sigma = max(second, range_eps ** 2) ** 0.5
+        s = output_scale / max(sigma, range_eps)
+        for i, j in spec.vector_blocks:
+            scale[i] = s
+            scale[j] = s
+
     for i, j in spec.vector_blocks:
+        if vector_mode == "global_rms":
+            break
         if vector_mode == "rms":
             second = 0.5 * ((mean[i] ** 2 + std[i] ** 2) + (mean[j] ** 2 + std[j] ** 2))
             sigma = torch.sqrt(second.clamp_min(range_eps ** 2))

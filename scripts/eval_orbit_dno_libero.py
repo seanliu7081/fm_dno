@@ -85,10 +85,22 @@ from oat.policy.dno_policy import DNOPolicy
 @click.option("--w-smoothness", default=1.0)
 @click.option("--w-seam", default=2.0)
 @click.option("--w-step-limit", default=5.0)
-@click.option("--w-table", default=10.0)
+@click.option("--w-table", default=0.0,
+              help="absolute table plane. DEFAULT 0 (OFF) on LIBERO-10: the demonstrated eef "
+                   "height is bimodal (gap at 0.815-0.889), so no scalar --table-z is both "
+                   "safe and active. Use --w-descent instead.")
+@click.option("--w-descent", default=10.0,
+              help="relative clearance: penalise descending more than --max-descent below the "
+                   "CURRENT eef height. Scene-height agnostic, so it works on both LIBERO-10 "
+                   "scene families at one setting.")
+@click.option("--max-descent", default=0.15,
+              help="metres of descent allowed below the current eef height before penalty")
 @click.option("--w-workspace", default=0.0)
 @click.option("--w-gripper", default=0.0)
-@click.option("--table-z", default=0.82, help="LIBERO table height in metres -- VERIFY THIS")
+@click.option("--table-z", default=0.44,
+              help="absolute table plane, only used when --w-table > 0. 0.44 sits below the "
+                   "measured p01 (0.448) of demonstrated eef height; the plan's 0.82 "
+                   "placeholder penalises every step of five of the ten tasks.")
 @click.option("--trans-gain", default=0.05, help="OSC_POSE output_max for position -- VERIFY THIS")
 @click.option("--workspace-lo", default="-0.35,-0.45,0.80")
 @click.option("--workspace-hi", default="0.35,0.45,1.35")
@@ -100,7 +112,8 @@ from oat.policy.dno_policy import DNOPolicy
 def main(checkpoint, output_dir, device, num_exp, use_dno, inference_prior,
          num_inference_steps, n_orbit, n_grad_steps, lr,
          typicality_weight, trust_weight, optimizer, no_warm_start, dno_steps,
-         w_smoothness, w_seam, w_step_limit, w_table, w_workspace, w_gripper,
+         w_smoothness, w_seam, w_step_limit, w_table, w_descent, max_descent,
+         w_workspace, w_gripper,
          table_z, trans_gain, workspace_lo, workspace_hi,
          n_test, n_parallel_envs, n_test_vis, max_batch):
 
@@ -138,13 +151,18 @@ def main(checkpoint, output_dir, device, num_exp, use_dno, inference_prior,
                   f"{policy.source_heading_hist.numel()} bins")
         policy.inference_prior = inference_prior
 
+    if w_table > 0:
+        print(f"!! --w-table={w_table} with --table-z={table_z}: LIBERO-10's demonstrated "
+              f"eef height is bimodal, so a scalar plane is either unsafe or inert. "
+              f"--w-descent is the scene-height-agnostic term.")
     task_loss = CompositeTaskLoss(
         weights={k: v for k, v in dict(
             smoothness=w_smoothness, seam=w_seam, step_limit=w_step_limit,
-            table=w_table, workspace=w_workspace, gripper=w_gripper,
+            table=w_table, descent=w_descent, workspace=w_workspace, gripper=w_gripper,
         ).items() if v > 0},
         trans_gain=trans_gain,
         table_z=table_z,
+        max_descent=max_descent,
         workspace_lo=[float(v) for v in workspace_lo.split(",")],
         workspace_hi=[float(v) for v in workspace_hi.split(",")],
     )
@@ -200,7 +218,7 @@ def main(checkpoint, output_dir, device, num_exp, use_dno, inference_prior,
                 "optimizer": optimizer, "warm_start": not no_warm_start,
                 "n_steps": dno_steps} if use_dno else None,
         "task_loss_weights": task_loss.weights,
-        "trans_gain": trans_gain, "table_z": table_z,
+        "trans_gain": trans_gain, "table_z": table_z, "max_descent": max_descent,
         "n_test": n_test, "num_exp": num_exp,
     }
     for k in keys:
