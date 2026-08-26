@@ -869,6 +869,173 @@ curve is at ~0.38 by epoch 400. Three candidate explanations, not yet separated:
 returns ~0.20, explanations 2/3 are live and the peak-then-decline possibility is real.
 Until that is run, **quote no absolute success rate without naming its protocol.**
 
+### 2026-08-25 — Track B stopped by request; Track A success rate measured
+
+**Track B stopped at epoch 796** (user decision: "750 epochs is enough"). Everything it
+produced is on disk and was verified after the stop: **16 rollout points** and **6
+checkpoints** including five top-k. What is given up is the 800→1001 tail, which would have
+distinguished "the high plateau holds" from "late decline" — see below, where that turns out
+to matter.
+
+**Track A had no success rate at all** until now: it runs `lazy_eval=True`, so no env is
+built, `mean_success_rate` never enters its log, and its top-k manager never fires. That was
+by design — G13 is measured offline — but it left the coupled arm's task performance unknown.
+
+Evaluated on a **snapshot** of the epoch-~800 rolling checkpoint (copied first, so the eval
+could not read a half-written file while training overwrites `latest.ckpt` every 10 epochs).
+
+### **Track A / P4 success rate = 0.0000**
+
+Zero on **all ten tasks**, `--no-dno`, standard prior, 10-step sampler, 50 episodes.
+
+**The eval harness is sound.** The same script, protocol and code path was run on
+`P1_norm_only` as a control and returned **0.2200**. A non-zero control through the identical
+path means P4's zero is a property of the policy, not of the harness.
+
+It is also exactly what P4's own diagnostics predicted:
+
+| | P4 | P1 |
+|---|---|---|
+| `heading_MAE` | **1.374 rad = 79°** | 0.623 rad = 36° |
+| `action_mse_N10` | 0.0824 | 0.0304 |
+
+A policy that departs 79° from the correct heading on average fails everything. **Gain 0.99
+and SR 0.000 are the same fact seen twice**: the coupling handed heading control to the noise
+phase so completely that, driven from unsteered isotropic noise, the policy is unusable.
+
+This is the delegation trade-off of design-doc §9.1 in its most extreme form — not "worse
+open-loop accuracy" but total open-loop collapse. `orbit_dno.py` states the contract:
+"never report an orbit-coupled policy's open-loop numbers as the method; that configuration
+is the ablation." Accordingly **0.000 is the `C` cell of the Phase 6 2×2**, the baseline that
+DNO must beat — not a verdict on the coupling.
+
+### **Protocol test — the leading hypothesis was WRONG**
+
+| measurement | SR |
+|---|---|
+| `P1_norm_only` @ 500 episodes (Phase 2) | 0.2013 |
+| `P1_norm_only` @ 50 episodes (same ckpt, now) | **0.2200** |
+
+**Protocol explains none of the 0.20-vs-0.37 gap.** Episode-set difficulty was ranked the most
+likely explanation in this log; it is eliminated. Consequences:
+
+* The retroactive caveat placed on Phase 2's absolute numbers is **lifted** — 0.186 / 0.201
+  are sound, and comparable to the 50-episode protocol.
+* `P1_curve`'s 0.37 plateau must therefore be **run-to-run variance** or a **real
+  peak-then-decline**. Supporting the latter: `P1_curve`'s final point (epoch 750) was 0.300,
+  its lowest of nine, and `P1_norm_only` sits at 0.20–0.22 by epoch 1001. That pattern says
+  **1001 epochs is past the peak** and top-k selection is genuinely necessary.
+* Stopping Track B at 796 means this cannot now be closed from within a single run. It is the
+  one thing that decision cost.
+
+### Queued immediately, both on the same snapshot
+
+1. **P5 — identical weights, `--inference-prior matched`.** The design's own remedy for
+   exactly this failure: P4 trained on a source whose headings were matched to targets
+   (deformed, R1 0.18), then was evaluated drawing uniform headings. Gate G3 predicted this
+   from `W1 = 0.2103` and prescribed P5. Histogram verified healthy: 1,153,152 samples across
+   128/128 bins.
+2. **P4 + stage-1 orbit DNO, K = 32** — the `D` cell, with `--w-table 0 --w-descent 10`
+   (§7.3: no scalar table plane is valid on LIBERO-10). With `C = 0.000` this asks the
+   project's central question in its sharpest form: can a 1-D search over the group orbit
+   recover a policy that is useless open-loop?
+
+### 2026-08-25 — P5 and stage-1 DNO: two explanations eliminated, one cause identified
+
+**P5 (matched prior) = 0.0000.** Same weights, `--inference-prior matched`, healthy histogram
+(1,153,152 samples over 128/128 bins). Gate G9 predicted "P5 ≥ P4, margin growing with `W1`";
+measured **P5 = P4 = 0.000**. The train/test prior shift of design-doc §5 is therefore **not**
+what broke P4.
+
+The reason is a marginal-versus-conditional distinction worth stating precisely.
+`MatchedHeadingPrior` re-imposes the **marginal** heading law — the aggregate distribution of
+source headings seen in training. But the coupling matched each source's heading to *its own
+target's* heading, a **per-sample conditional** relation. At inference the target is unknown,
+so sampling the correct marginal still hands the policy a heading uncorrelated with the one
+*this* observation requires. A policy that has delegated heading to the noise does not need a
+correctly-*distributed* heading; it needs the correct heading **for this observation**, and no
+fixed prior can supply that.
+
+**Stage-1 orbit DNO, K=32 = 0.0200** (1/50). Recovery from zero, but within noise of it, and
+10x below the plain iid control's 0.220.
+
+**The DNO machinery works perfectly; the objective is the problem.**
+
+```
+orbit_loss_spread   1.749          <- the objective DISCRIMINATES angles strongly
+orbit_loss  mean 0.815 -> best 0.205   (75% reduction, found every cycle)
+z_norm_ratio        1.0000         <- pure rotation, norm exactly preserved
+wall_time p50/p95   31 / 36 ms     <- REAL-TIME, 13x inside the 0.4 s control period
+```
+
+§8.4's designated failure mode (`orbit_loss_spread ≈ 0` → "a task-loss problem, not a coupling
+problem") **does not apply** — the spread is large and the search reliably finds the minimum.
+Yet success stays at zero. So the conclusion is forced: **the Tier-0 task loss is not a proxy
+for success on this benchmark.** Its terms — smoothness, seam, step-limit, descent — are all
+about *dynamic feasibility*; **none contains directional information**. Rotating the chunk to
+minimise them selects a heading that is smooth, safe, and task-arbitrary. This is not a
+weighting bug: Tier 0 is defined as "no privileged state, no learning", which excludes
+precisely the information the orbit search needs. `orbit_dno.py` states the risk in advance —
+"a task loss is a proxy; satisfying it is not success". The plan's own ladder names the
+remedy: **Tier 2**, a learned success classifier or Q-function over `(obs, chunk)`.
+
+### 2026-08-25 — Both tracks stopped by request; final evaluation
+
+Track A stopped at **epoch 958** (user: "we can evaluate the track now"). Track B had been
+stopped at 796. `logs.json` shows 959 distinct epochs, `train_loss` 0.11818, no errors.
+
+**Gate G13 CLOSED — gain stable across four independent reads:**
+
+| checkpoint | epoch | gain |
+|---|---|---|
+| early probe | ~330 | 0.99 |
+| probe | 754 | 1.02 |
+| probe | 786 | 1.01 |
+| **final diagnostics** | **958** | **1.04** |
+
+### **The transport half — now epoch-matched, and REFUTED**
+
+Previously withheld because P4 was at epoch 330 against P1 at 1001. Measured fairly:
+
+| metric | P1 @1000 | P4 @330 | **P4 @958** | verdict |
+|---|---|---|---|---|
+| `orbit_steering_gain` | −0.00000 | 0.99000 | **1.04000** | the positive result |
+| `src_orbit_eq_rel` | 1.10952 | 0.88675 | 0.90312 | lower — as predicted |
+| `heading_MAE` | 0.62267 | 1.37418 | 1.15597 | worse — delegation cost |
+| `action_mse_N10` | 0.03045 | 0.08239 | 0.07193 | worse — delegation cost |
+| `few_step_gap_N1` | **0.20833** | 0.39943 | 0.29034 | **WORSE** |
+| `few_step_gap_N4` | **0.07914** | 0.13307 | 0.10434 | **WORSE** |
+| `straightness` | **4.07690** | 6.49047 | 4.77540 | **WORSE** |
+
+**The "straighter transport buys inference steps" half of the thesis is not supported on real
+robot data — the coupling made transport worse on every metric.** P4's transport metrics did
+improve substantially from epoch 330 to 958 (straightness 6.49 → 4.78), i.e. it was still
+converging, but it never overtook the control. This is a clean negative result, not an
+artefact of undertraining.
+
+### Incident: `output/exp/probe/` emptied by something outside this session
+
+Between 07:32 and 12:08 the probe directory lost `probe_P1.json` and all rendered figures;
+`val_batch.pt` was silently rebuilt by the next measure call. **No repo script deletes that
+path** (the only `rm -rf` sites are `merge_data.py`, `convert_libero_dataset.py` and
+`eval_policy_sim.py`, all on their own output dirs, none of which ran). Cause unidentified —
+external to the commands issued here.
+
+**All twelve substantive result files were verified intact** (every `eval_log.json`,
+`dno_eval_log.json`, `diag*.json`, `paired_*.json`, `audit_*.json`, `P1_curve/logs.json`).
+Only regenerable artifacts were lost and were rebuilt in ~2 minutes; the control
+re-calibrated identically (−0.00000 / 0.031), confirming the rebuild is sound. Treat
+`output/exp/probe/` as not durable.
+
+### Success-rate summary (50-episode protocol, matched)
+
+| arm | SR |
+|---|---|
+| P1 iid control, DNO off | **0.2200** |
+| P4 coupled, DNO off | **0.0000** (all 10 tasks) |
+| P5 matched prior, DNO off | **0.0000** |
+| P4 + stage-1 DNO K=32 | **0.0200** |
+
 ## Where §6's decision matrix lands
 
 **Undetermined, pending G14.** `G13 >= 0.7` is settled, which fixes the *row* of §6's matrix
