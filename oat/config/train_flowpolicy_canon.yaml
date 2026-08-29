@@ -1,0 +1,187 @@
+# Construction A -- observation-canonicalized source phase.
+# COUPLING_MECHANISM_NOTES.md S3, gated by M1a.
+#
+# The admissibility criterion (notes S1): a coupling is legitimate iff the transformation it
+# applies to the source is a function of (o, fresh noise) only -- something the deployed
+# policy can re-run verbatim.  P4 set theta(z) := theta(x1), a statistic of the answer, and
+# scored 0.008.  This sets theta(z) := theta_ref(o) and applies the identical map on both
+# paths, so q_o = s_o exactly.
+#
+# Gate M1a (scripts/m1_residual_frame_audit.py, measured on this dataset):
+#   absolute chunk-heading concentration      R1 = 0.123
+#   residual against eef-motion direction     R1 = 0.593   <- the frame is informative
+#   per task                                  R1 = 0.54 .. 0.69, all ten
+#   state-only MLP upper bound (held out)     R1 = 0.821   <- headroom for a learned frame
+#
+# Judged on SR@N=10 paired against P1_curve, +/-0.065 bar (notes M3). The few-step channel is
+# closed (F0), so this arm is NOT about sampler steps -- it is about whether an easier phase
+# task makes a better field at the standard operating point.
+#
+# Launch:
+#   CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl python scripts/run_workspace.py \
+#       --config-name=train_flowpolicy_canon \
+#       seed=42 training.seed=42 training.num_epochs=1001 training.num_demo=500 \
+#       task.policy.lazy_eval=false training.rollout_every=50 \
+#       task.policy.env_runner.n_test=50 task.policy.env_runner.n_parallel_envs=5 \
+#       task.policy.env_runner.n_test_vis=0 checkpoint.topk.k=5 \
+#       hydra.run.dir=output/exp/A1_canon/seed42
+
+defaults:
+  - _self_
+  - task/policy: libero/libero10
+
+name: train_flowpolicy_canon
+_target_: oat.workspace.train_policy.TrainPolicyWorkspace
+
+seed: 42
+horizon: 16
+n_action_steps: 8
+n_obs_steps: 2
+task_name: ${task.policy.name}
+shape_meta: ${task.policy.shape_meta}
+
+policy:
+  _target_: oat.policy.flow_policy_canon.CanonicalPhaseFlowPolicy
+
+  shape_meta: ${shape_meta}
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+
+  # -- the canonicalization ---------------------------------------------------------
+  ref_frame: eef_motion          # atan2 of the planar eef displacement over the obs window
+  ref_key: robot0_eef_pos
+  min_ref_speed: 1.0e-4          # below this the direction is numerical noise -> skip.
+                                 # Reads only o, so skipping is admissible too.
+  kappa: .inf                    # von Mises dither around theta_ref. inf = exact
+                                 # canonicalization, which removes the source's phase
+                                 # freedom entirely given o. Finite kappa trades the
+                                 # representation shortcut back for source diversity and is
+                                 # the first knob to sweep if the arm over-commits.
+  canon_prob: 1.0
+
+  # -- unchanged from the orbit config ----------------------------------------------
+  action_spec:
+    action_dim: 7
+    vector_blocks: [[0, 1], [3, 4]]
+    scalar_dims: [2, 5, 6]
+    block_weights: [1.0, 0.0]
+
+  # REQUIRED, and asserted in the policy: theta_ref is a world-frame direction, and only the
+  # SO(2) repair makes the normalized source phase the same angle.
+  normalizer_mode: so2_block
+  normalizer_vector_mode: rms
+
+  coupling:
+    mode: iid                    # asserted: the canonicalization IS the coupling here
+    cost: angle
+    align: heading
+    scalar_weight: 0.0
+    kappa: .inf
+    coupling_prob: 1.0
+    min_heading_confidence: 0.0
+    assignment: hungarian
+
+  obs_encoder:
+    _target_: oat.perception.fused_obs_encoder.FusedObservationEncoder
+    _recursive_: false
+    shape_meta: ${shape_meta}
+    vision_encoder:
+      _target_: oat.perception.robomimic_vision_encoder.RobomimicRgbEncoder
+      crop_shape: [76, 76]
+    state_encoder:
+      _target_: oat.perception.state_encoder.ProjectionStateEncoder
+      out_dim: null
+
+  embed_dim: 256
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.1
+
+  num_inference_steps: 10
+  prior_noise_scale: 1.0
+
+training:
+  resume: True
+  allow_bf16: True
+  max_grad_norm: 1.0
+  num_epochs: 5001
+  val_every: 10
+  sample_every: 10
+  rollout_every: 100
+  checkpoint_every: 10
+  lr_scheduler: constant
+  lr_warmup_steps: 100
+  gradient_accumulate_every: 1
+  max_train_steps: null
+  max_val_steps: null
+  max_reconst_steps: null
+  seed: ${seed}
+  use_ema: True
+  num_demo: 500
+  tqdm_interval_sec: 1.0
+
+ema:
+  _target_: oat.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+optimizer:
+  policy_lr: 5.0e-5
+  obs_enc_lr: 1.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+
+dataloader:
+  # NOTE: batch size is a coupling hyper-parameter here, not a free training detail.
+  # A minibatch assignment approaches true OT as B grows, and its conditional bias
+  # grows with it too (a source can be handed to a target from a different observation).
+  # Report it, and hold it fixed across the comparison.
+  batch_size: 32
+  num_workers: 2
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+  drop_last: True
+
+val_dataloader:
+  batch_size: 32
+  num_workers: 2
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+  drop_last: True
+
+logging:
+  project: oat_dev
+  resume: True
+  mode: online
+  name: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_N${training.num_demo}
+  tags: ["${name}", "${task_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: mean_success_rate
+    mode: max
+    k: 5
+    format_str: "ep-{epoch:04d}_sr-{mean_success_rate:.3f}.ckpt"
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+  wandb_name_base: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_N${training.num_demo}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+  sweep:
+    dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+    subdir: ${hydra.job.num}

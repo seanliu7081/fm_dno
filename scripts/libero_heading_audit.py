@@ -17,10 +17,36 @@ Four questions, all cheap, all decisive:
 Reads only the ``action`` array out of the zarr, so it costs seconds and a few hundred MB,
 not the 3.4 GB the full dataset would.
 
+GATE F0c (PLAN_fewstep_coupling.md S2.3)
+----------------------------------------
+Section 4's coupling preview was originally measured at ``scalar_weight=0.0`` and B=256 --
+i.e. with the assignment cost blind to the invariant channels, which on LIBERO-10 carry
+84.5% of the raw chunk energy, and at a batch size no training arm uses.  ``--scalar-weight``,
+``--batch-size`` and ``--block-weights`` re-measure it under the settings the arms actually
+train with, and the preview now prints the path-length reduction against the iid row, which
+is the number F0c gates on:
+
+    B=128 improves the reduction by < 2 points over B=32   -> drop the P3b batch-size arm
+    euclidean @ scalar_weight=1.0 still reads < 10%        -> P3's prior drops accordingly
+
+**Every default is unchanged on purpose** (``scalar_weight=0.0``, ``batch_size=256``,
+``block_weights=None``), so an invocation written before these flags existed still audits
+the same configuration.  Two things about section 4's numbers did change and are not
+settings: the source draws are now reseeded per variant, so every coupling is scored on the
+*same* noise and a row-to-row path-length difference is the assignment rather than the draw;
+and the chunk count is held fixed as ``--batch-size`` varies, so a B=32-vs-B=128 comparison
+changes the assignment problem and nothing else.
+
 Usage:
     python scripts/libero_heading_audit.py
     python scripts/libero_heading_audit.py --zarr data/libero/libero10_N500.zarr --horizon 16
     python scripts/libero_heading_audit.py -o output/audit/libero10.json
+
+    # F0c: the settings every coupling arm actually trains with
+    python scripts/libero_heading_audit.py --scalar-weight 1.0 --block-weights 1,0 \
+        --batch-size 32  -o output/audit/f0c_sw1_b32.json
+    python scripts/libero_heading_audit.py --scalar-weight 1.0 --block-weights 1,0 \
+        --batch-size 128 -o output/audit/f0c_sw1_b128.json
 """
 
 from __future__ import annotations
@@ -77,9 +103,27 @@ def main() -> None:
     ap.add_argument("--max-chunks", type=int, default=40000)
     ap.add_argument("--action-key", default="action")
     ap.add_argument("-o", "--output", default="output/audit/libero10_heading_audit.json")
+    # ---- F0c knobs.  Defaults reproduce the original audit exactly. ------------------
+    ap.add_argument("--scalar-weight", type=float, default=0.0,
+                    help="weight of the SO(2)-invariant channels in the assignment cost. "
+                         "The arms train at 1.0; the original audit measured 0.0.")
+    ap.add_argument("--batch-size", type=int, default=256,
+                    help="assignment batch for section 4. Minibatch OT strengthens with B "
+                         "and its conditional bias grows with it -- measure, do not assume.")
+    ap.add_argument("--block-weights", default=None,
+                    help="comma-separated per-vector-block weights, e.g. '1,0' for the "
+                         "translation-only coupling every arm uses (G4'). Default: uniform.")
     args = ap.parse_args()
 
-    spec = SO2ChunkSpec.libero_osc_pose()
+    block_weights = None
+    if args.block_weights:
+        block_weights = tuple(float(v) for v in args.block_weights.split(","))
+    spec = SO2ChunkSpec(
+        action_dim=7, vector_blocks=((0, 1), (3, 4)), scalar_dims=(2, 5, 6),
+        block_weights=block_weights,
+    )
+    print(f"spec: block_weights={spec.weights}   coupling cost: "
+          f"scalar_weight={args.scalar_weight}  batch={args.batch_size}")
     print(f"loading actions from {args.zarr} ...")
     rb = ReplayBuffer.copy_from_path(args.zarr, keys=[args.action_key])
     actions = np.asarray(rb[args.action_key])
@@ -94,7 +138,12 @@ def main() -> None:
     raw = build_chunks(actions, episode_ends, args.horizon, args.stride, args.max_chunks)
     print(f"  {raw.shape[0]} chunks of horizon {args.horizon}\n")
 
-    report = {"zarr": args.zarr, "horizon": args.horizon, "n_chunks": int(raw.shape[0])}
+    report = {
+        "zarr": args.zarr, "horizon": args.horizon, "n_chunks": int(raw.shape[0]),
+        "scalar_weight": float(args.scalar_weight),
+        "coupling_batch_size": int(args.batch_size),
+        "block_weights": list(spec.weights),
+    }
 
     # ---- normalizers -----------------------------------------------------------------
     flat = raw.reshape(-1, spec.action_dim)
@@ -210,11 +259,16 @@ def main() -> None:
         report["verdict"] = "matched_prior_required"
 
     # ---- what each coupling would do -------------------------------------------------
+    B = int(args.batch_size)
     print("\n" + "=" * 78)
-    print("4  COUPLING PREVIEW  (batch 256, real chunks, no training)")
+    print(f"4  COUPLING PREVIEW  (batch {B}, scalar_weight {args.scalar_weight}, "
+          f"real chunks, no training)")
     print("=" * 78)
-    print(f"  angle gap cannot go below W1 = {w1:.4f} for any marginal-preserving coupling\n")
-    print(f"  {'coupling':<22}{'path len':>10}{'angle gap':>11}{'cond var':>11}{'src R1':>9}")
+    print(f"  angle gap cannot go below W1 = {w1:.4f} for any marginal-preserving coupling")
+    print("  'path red.' is the reduction in mean path length against the iid row -- the")
+    print("  quantity Gate F0c reads.\n")
+    print(f"  {'coupling':<22}{'path len':>10}{'path red.':>11}{'angle gap':>11}"
+          f"{'cond var':>11}{'src R1':>9}")
     variants = {
         "A/iid": dict(mode="iid"),
         "P2/perm-angle": dict(mode="perm", cost="angle"),
@@ -222,23 +276,34 @@ def main() -> None:
         "P4/rot-heading": dict(mode="rot", align="heading"),
         "P6/perm+rot-group": dict(mode="perm_rot", cost="group_ot"),
     }
-    g = torch.Generator().manual_seed(0)
-    n_batches = min(24, x.shape[0] // 256)
+    # Same total number of chunks regardless of B, so the batch-size comparison changes the
+    # assignment problem and nothing else.
+    n_batches = max(1, min(24 * 256 // B, x.shape[0] // B))
+    report["n_coupling_batches"] = int(n_batches)
     report["coupling_preview"] = {}
+    baseline_path = None
     for name, cfg in variants.items():
-        c = SO2OrbitCoupling(spec, **cfg)
+        # reseed per variant: every coupling sees the SAME source draws, so a path-length
+        # difference between rows is the assignment and not the noise.
+        g = torch.Generator().manual_seed(0)
+        c = SO2OrbitCoupling(spec, scalar_weight=args.scalar_weight, **cfg)
         rows, r1s = [], []
         for b in range(n_batches):
-            x1 = x[b * 256 : (b + 1) * 256]
+            x1 = x[b * B : (b + 1) * B]
             z0 = torch.randn(x1.shape, generator=g)
             zc, d = c(z0, x1)
             rows.append(transport_stats(zc, x1, spec))
             r1s.append(d["coupling/src_heading_R1"])
         agg = {k: sum(r[k] for r in rows) / len(rows) for k in rows[0]}
         r1 = sum(r1s) / len(r1s)
-        print(f"  {name:<22}{agg['path_len']:>10.4f}{agg['angle_gap']:>11.4f}"
-              f"{agg['cond_vel_var']:>11.4f}{r1:>9.4f}")
-        report["coupling_preview"][name] = {**agg, "src_heading_R1": r1}
+        if baseline_path is None:
+            baseline_path = agg["path_len"]
+        red = 1.0 - agg["path_len"] / max(baseline_path, 1e-12)
+        print(f"  {name:<22}{agg['path_len']:>10.4f}{red * 100:>10.2f}%"
+              f"{agg['angle_gap']:>11.4f}{agg['cond_vel_var']:>11.4f}{r1:>9.4f}")
+        report["coupling_preview"][name] = {
+            **agg, "src_heading_R1": r1, "path_len_reduction_vs_iid": float(red),
+        }
 
     out = pathlib.Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

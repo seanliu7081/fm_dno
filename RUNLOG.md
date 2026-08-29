@@ -1062,3 +1062,444 @@ translation-only variant as a labelled ablation only if compute allows.
 
 Open gates: **G6** (P0 vs P1 normalizer control), **G7**–**G9**, **G11**–**G12**.
 Not started: Phases 2–7. Per §10 the full matrix is ~18 trainings plus evals.
+
+---
+
+# PLAN_fewstep_coupling.md — implementation + Phase F0
+
+## 2026-08-27 — Arm R (reflow) implemented; F0c read; F0a launched
+
+### G0 re-checked before touching anything
+
+`git diff --name-only 15b93ee HEAD --diff-filter=M` → **empty**. No original repo file has
+ever been modified. Everything below is either a new file or an additive extension of a
+file this project itself added after 15b93ee (`scripts/libero_heading_audit.py`,
+`scripts/report_coupling_diagnostics.py`), which §0.1 permits and §2.3 names explicitly.
+
+### New files
+
+| file | what it is |
+|---|---|
+| `oat/dataset/reflow_pairs.py` | `ReflowPairDataset` + `ReflowPairSet`. Wraps `ZarrDataset`, replaces `action` with the donor's distilled endpoint, adds `reflow_z`. Carries **Gate R2**. |
+| `oat/policy/flow_policy_reflow.py` | `ReflowFlowPolicy(OrbitFlowPolicy)`. `init_ckpt` warm start (**R3**), `forward` reads `x0` from the batch, `set_normalizer` runs **R1**. |
+| `scripts/generate_reflow_pairs.py` | walks both splits in index order, draws one `z` per index from a per-index generator, integrates N_gen Euler steps, writes `{train,val}.npz` + `meta.json`. |
+| `oat/config/train_flowpolicy_reflow.yaml` | the orbit config with the six swaps of §3.1. `_self_` moved **last** in `defaults` so the `task:` block can override the dataset instead of being overwritten by it. |
+| `scripts/run_fewstep_f0.sh` | F0a / F0b / F0c driver. Idempotent — skips any step whose output exists. |
+| `scripts/report_fewstep_table.py` | §5's table: arms × N, paired ΔSR at each N, and the two pre-registered success criteria evaluated rather than eyeballed. |
+
+Additive flags on our own scripts: `--scalar-weight` / `--batch-size` / `--block-weights`
+on the heading audit (§2.3), `--action-source {dataset,demo}` on the diagnostics script.
+
+### How the alignment gate actually works (R2)
+
+The pair file stores a **SHA1 of the `SequenceSampler` index table** — the
+`(buffer_start, buffer_end, sample_start, sample_end)` rows — alongside `num_demo`,
+`val_ratio`, `seed`, horizon, obs keys and split lengths. Any change that renumbers windows
+changes the hash, and `ReflowPairDataset` hard-fails with a field-by-field diff. There is no
+flag to disable it. Verified by construction: building the dataset at `val_ratio=0.2`
+against `val_ratio=0.1` pairs raises.
+
+### Three traps found while building it, all closed
+
+1. **`action_mse_*` and `heading_MAE` are not comparable across arms by default.** They are
+   measured against `batch['action']`, which for a reflow arm is the *donor's distilled
+   endpoint*, not the demonstration. Measured on the smoke checkpoint: 0.0220 against the
+   distilled target vs **0.0616** against the demo — the same policy, a factor of 2.8 apart.
+   `--action-source demo` unwraps to the base `ZarrDataset` and fixes it. `straightness` and
+   `few_step_gap_*` need no ground truth, so they were always comparable; those are the two
+   §3.2 gates on.
+2. **A missing `init_ckpt` must fail for training and *not* for loading.**
+   `BasePolicy.from_checkpoint` re-runs `__init__`, so raising there would make every
+   finished reflow checkpoint unloadable the moment the donor moved. The warm start now warns
+   and defers; `set_normalizer` — which only the training workspace calls, before the first
+   gradient step — raises. Both paths verified.
+3. **The observation encoder is stochastic even in eval.** This repo leaves
+   `eval_fixed_crop=False`, so robomimic's `CropRandomizer` takes a *random* crop in eval
+   mode — during rollouts too. Distilling the sampler that scored 0.400 therefore means
+   distilling it under the crop distribution it actually runs under, which is what the
+   generator does (global RNG seeded per batch for rerun reproducibility).
+   `--center-crop` takes the other trade if wanted.
+
+### Gate F0c — CPU audit, **both sub-gates fire**
+
+Path-length reduction vs iid, B=32, 6144 chunks, `block_weights=[1,0]`, `scalar_weight=1.0`
+— i.e. the settings every coupling arm actually trains under:
+
+| coupling | red. @ B=32 | red. @ B=128 | Δ (points) |
+|---|---|---|---|
+| P2 / perm-angle | 3.38% | 4.82% | +1.43 |
+| P3 / perm-euclid | **4.89%** | 6.55% | **+1.65** |
+| P6 / perm+rot-group | 6.97% | 8.12% | +1.15 |
+| P4 / rot-heading | 2.75% | 2.75% | +0.00 |
+
+* **F0c(a): B=128 buys +1.65 points over B=32, below the 2-point bar → drop the P3b
+  batch-size arm.** Exactly the plan's prediction for a 112-D chunk.
+* **F0c(b): euclidean OT at `scalar_weight=1.0` reads 4.89%, not ≥10% → P3's prior drops.**
+  Train it only if a GPU would otherwise sit idle.
+
+**A correction to the plan's premise.** §0 attributes "8.1% at B=32" to `euclidean`. It is
+not euclidean's number. Decomposing at B=32:
+
+| setting | P2 angle | P3 euclid | P6 group |
+|---|---|---|---|
+| `scalar_weight=0.0`, blocks uniform (the original audit) | 1.80% | 5.54% | **8.37%** |
+| `scalar_weight=0.0`, blocks `[1,0]` | 1.95% | 3.51% | 5.01% |
+| `scalar_weight=1.0`, blocks uniform | 3.39% | 6.64% | 9.87% |
+| `scalar_weight=1.0`, blocks `[1,0]` ← what the arms train | 3.38% | 4.89% | 6.97% |
+
+8.1% is **P6 / perm+rot-group** (8.37% here at B=32), a rotation-applying coupling that §0
+rules out on leakage grounds. Euclidean OT was 5.54% at those settings and is 4.89% at the
+arms'. The two effects pull opposite ways and both are real: turning `scalar_weight` on
+**helps** (+1.4 to +1.9 points — the cost seeing the 84.5% of raw energy in the invariant
+channels is worth something, as §1 argued), while `block_weights=[1,0]` **hurts** (−1.6 to
+−3.4 points, because it halves the coordinates the assignment can match on). Net, the arm
+that will actually be trained is weaker than the plan assumed, so P3's prior drops further
+than F0c(b) alone implies. P2's own number moved the other way: 3.38%, up from the 2.4%
+§0 predicted.
+
+### Arm R — pairs generated, all three gates green
+
+Donor `P1_curve/seed42/checkpoints/ep-0600_sr-0.400.ckpt` (the plan's selection rule —
+highest SR in the filename, ties to the later epoch; three checkpoints tie at 0.400).
+
+```
+output/reflow_pairs/P1_curve_ep0600_N10_z0   178 MB
+  train  124342 pairs   path_len 13.5734   |x1|rms 0.9087   roundtrip 4.77e-07
+  val     13748 pairs   path_len 13.0773   |x1|rms 0.8311   roundtrip 2.38e-07
+  index_sha1 3862016d7ced   N_gen 10   z_seed 0
+```
+
+**The donor's action normalizer is bit-identical to a fresh fit on the dataset**
+(`|checkpoint − dataset refit| = 0.000e+00`), which is what makes R1 pass by construction
+rather than by luck. Generation took ~2 minutes at ~3400 windows/s, not the 1–3 h §3.1
+budgeted — the whole §3.3 budget line for pairs can be deleted.
+
+At training start, on the real run:
+
+```
+reflow : loaded 482 donor tensors; 0 missing, 0 unexpected  (exact match)      <- R3
+[R1] pairs/normalizer agree: params <= 0.00e+00,
+     normalize(action_env) vs x1_norm <= 4.77e-07                              <- R1
+```
+
+R2 is enforced at dataset construction (fingerprint matched). Every gate was also verified
+to **fire** on a deliberately broken input: a 0.1% perturbation of the stored `norm_scale`
+raises R1; `val_ratio=0.2` against `val_ratio=0.1` pairs raises R2; a nonexistent
+`init_ckpt` raises R3 at `set_normalizer`; a `--limit`-truncated pair file is refused
+outright.
+
+### Running now
+
+| GPU | job | note |
+|---|---|---|
+| 0 | **F0a** headroom sweep, N ∈ {1,2,4,10}, n_test 200 | the go/no-go. ~50 min per N under CPU contention |
+| 1 | **R1_reflow** training, 301 epochs, rollout_every 25, `num_inference_steps=2` | ~2.0 min/epoch measured → ~10 h + rollouts |
+
+Arm R was launched before F0a returned, deliberately: it survives two of F0a's three
+branches (only `gap < 0.05` kills it), and it is killable at any epoch. **If F0a returns
+`gap < 0.05`, stop `R1_reflow` — the answer is already "no headroom" and the N-sweep itself
+is the result.**
+
+## 2026-08-27 — **Gate F0a: NO HEADROOM. The baseline already runs at N=2 for free.**
+
+`P1_curve/seed42/checkpoints/ep-0600_sr-0.400.ckpt`, `--no-dno`, standard prior, 200
+episodes (20/task) per point.
+
+| N | SR | paired Δ vs N=10 | paired stderr | p (t) | verdict |
+|---|---|---|---|---|---|
+| 1 | 0.2750 | **−0.0700** | ±0.0260 | **0.025** | significant |
+| 2 | **0.3600** | +0.0150 | ±0.0388 | 0.708 | not significant |
+| 4 | 0.2800 | −0.0650 | ±0.0373 | 0.115 | not significant |
+| 10 | 0.3450 | — | — | — | reference |
+
+**`gap = SR(N=10) − SR(N=2) = −0.0150`.** Below the 0.05 bar, and negative: two steps scored
+*higher* than ten. Gate F0a's third row fires — "the 10-step sampler was never the
+bottleneck; the goal is already achieved by the baseline. Do not train anything."
+
+Per the kill rule, **`R1_reflow` was stopped at epoch 13** (its epoch-0 rollout had already
+scored 0.300 at N=2). Nothing is lost: the pairs, the config and `training.resume=True` mean
+it restarts from `latest.ckpt` if the PI overrides this reading. P2/P3 were never launched.
+
+### What the paired numbers say that the aggregate does not
+
+* **N=2 ≡ N=10 at this resolution.** Δ = +0.015 ± 0.039; the 95% CI is [−0.073, +0.103], so
+  an N=10-over-N=2 advantage as large as the plan's *strong-result* bar (0.15) is excluded,
+  and so is one as large as the *useful* bar (0.065) in most of the interval. Per-task
+  reshuffle is 6.3× the aggregate, so per-task rates are the honest report — but the two
+  budgets are not distinguishable in the mean.
+* **N=1 is the only real cost, and it is small: −0.070 ± 0.026, p = 0.025.** Note its paired
+  sd (0.082) is *smaller* than N=2's or N=4's (0.12): dropping to a single Euler step hurts
+  coherently across tasks, whereas N=2/N=4-vs-N=10 is dominated by reshuffle. That is what
+  makes a 7-point effect resolvable where a 6.5-point one is not.
+* **N=4 = 0.280 is below both N=2 and N=10.** Non-monotonic, and −0.065 ± 0.037 is inside
+  the ±0.084 MDE, so it is rollout noise rather than a finding. It is also the honest
+  warning that at n_test=200 the resolution is ~0.085 and the effects here are smaller.
+
+### The mechanism — and why this is a result rather than a non-event
+
+Offline diagnostics on the same checkpoint (`output/exp/P1_curve/seed42/diag.json`):
+
+| metric | ep-0600 |
+|---|---|
+| `straightness` | 4.928 |
+| `few_step_gap_N1` | 0.263 |
+| `few_step_gap_N4` | 0.099 |
+| `action_mse_N10` | 0.053 |
+
+**The field is genuinely curved and the few-step endpoints genuinely move — and none of it
+reaches the task.** A single Euler step lands 26% (relative) away from the converged
+endpoint and costs 0.070 of success; four steps land ~10% away and cost nothing measurable.
+So the premise §0 built the whole arm table on — "curved trajectories at small N cost task
+success" — is *false at this operating point*, not merely unproven. The transport metrics
+and the success rate are decoupled, which is exactly the coupling-to-task gap this project
+found once before (G13: gain 1.04 with SR 0.000) now seen from the other side.
+
+The plausible reason is receding-horizon execution: the policy emits a 16-step chunk, runs 8
+of them, then re-plans from a fresh observation. Closed-loop re-planning at 2.5 Hz absorbs
+an endpoint perturbation that an open-loop metric reports at full size.
+
+### Deliverable and status
+
+The N-sweep **is** the result: *this LIBERO-10 flow policy runs at 2 Euler steps for a 5×
+inference-cost reduction with no measurable success cost, and at 1 step for 7 points.*
+Written to `output/exp/FEWSTEP.md`; paired stats in
+`output/exp/paired_P1curve_N{1,2,4}_vs_N10.json`.
+
+F0b (re-selection at N=2) was **not** run: its purpose was to give the trained arms a fair
+N=2 baseline, and there are no trained arms.
+
+**Open, for the PI.** At n_test=200 the paired MDE is ±0.088 for N=2-vs-N=10. Since the
+sweep is now the product rather than a gate, a rerun of N ∈ {1, 2, 10} at n_test=500 would
+take the MDE to ≈0.055 and settle the N=4 anomaly — ~4 h on the two idle GPUs. The plan only
+mandates n_test=500 in its ambiguous branch (gap 0.05–0.15), which this is not, so it is a
+judgement call and has not been started.
+
+## 2026-08-27 — F0a rerun at n_test=500. Monotone, and the verdict holds.
+
+The 200-episode sweep was under-resolved (paired MDE ±0.088) and non-monotonic at N=4. Rerun
+at **500 episodes (50/task)**, split across both GPUs, same checkpoint `ep-0600_sr-0.400`.
+
+| N | SR | paired Δ vs N=10 | paired stderr | p (t) | MDE @ p<0.05 | verdict |
+|---|---|---|---|---|---|---|
+| 1 | 0.2400 | **−0.1020** | ±0.0284 | **0.006** | 0.064 | significant |
+| 2 | 0.3060 | −0.0360 | ±0.0311 | 0.277 | 0.070 | not significant |
+| 4 | 0.3320 | −0.0100 | ±0.0218 | 0.657 | **0.049** | not significant |
+| 10 | 0.3420 | — | — | — | — | reference |
+
+**`gap = SR(N=10) − SR(N=2) = +0.0360`.** Still below the 0.05 bar, so **Gate F0a's verdict is
+unchanged: no headroom, train nothing.** The sign flipped (it was −0.015 at n_test=200), which
+is the expected behaviour of a quantity that is genuinely near zero measured twice.
+
+**The N=4 anomaly was noise, as suspected.** It moved 0.280 → 0.332 and the curve is now
+monotone in N. N=10 barely moved (0.345 → 0.342); N=2 and N=1 both came down. Treat the
+500-episode numbers as authoritative and the 200-episode ones as the first read.
+
+### What sharpened
+
+* **N=4 is the tight null, not N=2.** Δ = −0.010 ± 0.022 with an MDE of **0.049** — the
+  strongest equivalence statement in the table, and a 2.5× inference saving. The honest
+  headline is *"this policy runs at 4 Euler steps for free"*, with N=2 as the aggressive
+  option rather than the claim.
+* **N=2 is cheap but not free.** Δ = −0.036 ± 0.031, 95% CI ≈ [−0.106, +0.034]. It passes the
+  gate's 0.05 bar on the point estimate, but the interval does not exclude a cost the size of
+  the plan's 0.065 "useful" threshold. Quote it as "−0.036, not resolvable at one seed",
+  never as "free".
+* **N=1 costs more than the first read said: −0.102 ± 0.028, p = 0.006** (was −0.070,
+  p = 0.025). Its paired sd stays the smallest of the three (0.090) and its reshuffle ratio is
+  1.0× — a single Euler step degrades every task roughly equally, which is what makes a
+  10-point effect resolvable at one seed while a 3.6-point one is not.
+
+### The finding, restated at full resolution
+
+`straightness = 4.93` and `few_step_gap_N1 = 0.263` / `few_step_gap_N4 = 0.099` say the
+learned field is curved and the few-step endpoints genuinely move. The sweep says a ~10%
+relative endpoint error (N=4) costs **0.010 ± 0.022** of success and a ~26% one (N=1) costs
+0.102. So the transport metric is a poor predictor of task cost at small perturbations and a
+usable one only once the perturbation is large: **curvature is real, and mostly absorbed.**
+Receding-horizon execution — 16-step chunk, 8 executed, re-plan — is the plausible absorber,
+and it is testable: shrinking `n_action_steps` should make the same curvature start to bite.
+
+### Final state
+
+Nothing is running; both GPUs idle. No arm was trained (F0a killed them; F0c had already
+dropped P3b and demoted P3). `output/exp/FEWSTEP.md` carries the table, `paired500_*.json`
+the statistics. Arm R is fully built, gated and validated, its pairs generated
+(`output/reflow_pairs/P1_curve_ep0600_N10_z0`, 178 MB) and its 13 trained epochs preserved —
+it can be resumed from `latest.ckpt` with one command if the operating point ever changes.
+
+---
+
+# COUPLING_MECHANISM_NOTES.md — Gates M1 and M2
+
+## 2026-08-27 — M1 PASSES both halves; M2 passes but corrects the notes on *why*
+
+Everything below is CPU/data-only, no training, per the notes' "an afternoon of data
+analysis before a GPU". New files: `scripts/m1_residual_frame_audit.py`,
+`scripts/m2_blockwise_coupling_audit.py`, `oat/symmetry/coupling_blockwise.py`,
+`oat/policy/flow_policy_canon.py`, `oat/policy/flow_policy_blockwise.py`,
+`oat/config/train_flowpolicy_{canon,blockwise}.yaml`. G0 unchanged.
+
+`oat/symmetry/coupling.py` was **not** edited (the notes suggested adding the mode there);
+the blockwise coupling is a new module subclassing `SO2OrbitCoupling`, which gets the same
+result with zero risk to the already-trained arms' code path.
+
+### Gate M1a — is Construction A alive?  **YES, and on every task.**
+
+124,342 train windows, window-aligned exactly as `ZarrDataset` builds them (the vectorised
+extractor is checked against `SequenceSampler.sample_sequence` on 64 random windows before
+anything is computed). 98.0% usable after the confidence and speed floors.
+
+| frame (observation-only) | R1 | R1 gated | circular MAE |
+|---|---|---|---|
+| absolute — no frame | 0.1232 | 0.1270 | 1.623 |
+| per-task circular mean (what `task_uid` alone buys) | 0.1727 | 0.1781 | 1.346 |
+| **eef-motion direction** | **0.5926** | **0.6009** | **0.760** |
+| state-only MLP, held-out episodes | — | **0.8211** | 0.417 |
+
+The notes quote absolute R1 = 0.1511; measured here it is 0.1232, the difference being
+window-aligned chunks versus the old stride-4 sampling. Either way the eef-motion frame
+clears the notes' ≳0.5 bar, and it does so **uniformly**: per-task residual R1 runs
+0.5375–0.6940 across all ten tasks, with no task where the frame fails (the per-task absolute
+R1 ranges 0.026–0.402, so the frame is not merely re-reading a task prior).
+
+The state-only MLP is the upper bound on any **non-visual** `theta_ref` head — 0.821 on
+held-out episodes. It does **not** bound a vision-conditioned head, which could do better.
+Construction A therefore has ~0.23 of concentration in reserve above the cheap frame; the
+cheap frame goes first because it ships nothing and cannot drift out of sync.
+
+### Gate M1b — is there anything for *any* coupling to reduce?  **At most 24.1%.**
+
+Fraction of chunk variance surviving each observation-only conditioner:
+
+| block | total var | given (task, progress decile) | given kNN(eef, Δeef, progress) |
+|---|---|---|---|
+| vec0 (dx,dy) | 31.38 | 49.8% | 11.2% |
+| vec1 (wx,wy) | 32.36 | 81.1% | 42.7% |
+| dz | 2.40 | 65.1% | 13.1% |
+| wz | 0.94 | 41.0% | 16.9% |
+| grip | 15.84 | 37.6% | 13.8% |
+| **ALL** | **82.92** | **60.0%** | **24.1%** |
+
+Read this as an **upper bound**: the kNN conditioner has no vision, so a policy that sees the
+cameras knows strictly more and the true within-`o` spread is ≤ 24.1%. There is something
+left, but not a lot, and most of what survives sits in `vec1` — the block that carries 0.34%
+of *raw* action energy and is only at parity after the rms normalizer. That is the notes' §2
+worry in numbers: not fatal, but it caps what any data-side coupling can be worth.
+
+### Gate M2 — blockwise assignment.  Worth a GPU, for a different reason than predicted.
+
+Real chunks, `block_weights=[1,0]`, 6144 windows, iid as the reference row.
+
+**Path-length reduction, per block, B=32:**
+
+| coupling | vec0 | vec1 | dz | wz | grip | ALL |
+|---|---|---|---|---|---|---|
+| joint `perm` (euclid, sw=1) | 9.98% | −0.04% | 4.02% | 1.79% | 10.56% | 5.65% |
+| blockwise, `vector_cost=group_ot` | 0.10% | 0.62% | 10.39% | 5.55% | 12.94% | 3.56% |
+| **blockwise, `vector_cost=euclidean`** | **12.18%** | **12.14%** | **10.39%** | **5.55%** | **12.94%** | **11.76%** |
+| blockwise, within-task | 0.39% | 0.45% | 8.37% | 4.18% | 10.64% | 3.03% |
+| gripper block only | 0 | 0 | 0 | 0 | 12.94% | 2.10% |
+
+**Small-`t` conditional target variance `Var[u | x_t, t]`, reduction vs iid** (kNN in the full
+`x_t`, which is what the network conditions on):
+
+| coupling | t=0.05 | t=0.10 | t=0.25 | t=0.50 |
+|---|---|---|---|---|
+| joint `perm` | 14.04% | 16.02% | 18.28% | 9.99% |
+| blockwise `group_ot` | 13.23% | 11.77% | 9.93% | 5.68% |
+| **blockwise `euclidean`** | **29.49%** | **31.65%** | **32.54%** | **20.52%** |
+| blockwise within-task | 9.84% | 9.06% | 8.31% | 4.69% |
+
+At B=128 the same ordering holds and blockwise scales better: joint 6.97% path / 17.47% var,
+blockwise-euclid 14.01% / 35.75%. **Ratio to the joint assignment: 2.1× on the quantity that
+matters.** Marginal audit is clean throughout: per-block drift exactly 0.00e+00 for every
+blockwise variant; joint drift 1.0–1.7 as the module docstring predicts and explains.
+
+**Three corrections to the notes, all from measurement.**
+
+1. **`group_ot` is the wrong per-block cost, and the reason is exact.** The phase-invariant
+   modulus scores the transport achievable *after an optimal rotation*; a permutation applies
+   no rotation, so it optimizes a bound it cannot realize. On the vector blocks it buys
+   0.10% and 0.62% — nothing. `euclidean` buys 12.18% and 12.14% on the same blocks. The
+   symmetry still earns its keep in B, but by choosing **which product structure to factor
+   over**, not by supplying the cost. This is a cleaner statement of "group-aware coupling"
+   than the notes had, and it is falsifiable.
+2. **Within-task restriction lowers the gain**, at both batch sizes (11.76% → 3.03% at
+   B=32). A batch of 32 leaves ~3 same-task members; the matching pool collapses. The notes'
+   argument that it should improve the *gain/bias ratio* may still hold, but the gain side is
+   measurably worse and the bias side is not observable here. Off by default; it needs
+   task-grouped sampling to be testable at all.
+3. **The gripper thesis is half right.** The gripper does show the largest per-block
+   reduction (12.94%), and it is where even the *joint* assignment concentrates its effort
+   (23.3% conditional-variance reduction there vs 14.0% overall). But blockwise's
+   *incremental* gain on the gripper alone is modest (27.9% vs 23.3%), and a gripper-only
+   coupling reads just 3.7% overall. **The real win of blockwise is that it reduces every
+   block at once**, which the joint assignment structurally cannot — its single 112-D cost is
+   dominated by the high-variance coordinates and leaves `vec1` at −0.04%.
+
+### Constructions built, and the one property that had to be verified
+
+Construction A (`CanonicalPhaseFlowPolicy`) is the admissibility criterion made executable:
+`theta(z) := theta_ref(o)` via one method, `canonicalize_source`, called by **both**
+`forward` and `predict_action` so neither can drift. Verified on a trained smoke checkpoint
+against real validation observations:
+
+```
+max |theta(z') - theta_ref|      1.43e-06        the canonicalization lands
+untouched where invalid          True            the speed floor reads only o
+norm preserved (rotation only)   9.54e-07        no probability mass created
+train source == inference src    True            <- q_o = s_o, byte-identical
+deterministic given (z, o)       True            never looks at x1
+R1 residual vs imposed source    0.6949          M1a reproduced inside the policy
+```
+
+The class also refuses `normalizer_mode != 'so2_block'`: `theta_ref` is a world-frame
+direction and only the SO(2) repair makes the normalized source phase the same angle — under
+per-dimension min-max the frame is sheared by ~0.24 relative error and the canonicalization
+points somewhere else entirely. That failure would have been silent.
+
+`sample_prior` (obs-free, inherited) deliberately returns the **un**-canonicalized draw, and
+says so: for this arm that is not the law the field was trained on. `sample_prior_from_obs`
+is the honest one, and `report_coupling_diagnostics.py` should use it for arm A.
+
+## 2026-08-27 — M3 launched.  Operational finding: these arms do not fit two-to-a-box.
+
+`A1_canon` (GPU 0) and `B1_blockwise` were launched together at 801 epochs, matched protocol
+(seed 42, num_demo 500, `lazy_eval=false`, `rollout_every=50`, `n_test=50`,
+`n_parallel_envs=5`, `topk.k=5`, `block_weights=[1,0]`). B1 died silently within minutes,
+twice, with an empty log after its init banner.
+
+**Cause: the OOM killer, exit code 137**, confirmed by running B1 in the foreground. Not a
+bug in either construction — B1 smoke-trains fine on a small zarr, and it died before
+reaching its own code.
+
+The number that matters, and that was not in the RUNLOG before: **one of these runs costs
+~41 GB, not the 14 GB its main process reports.** Measured as PSS + swap across the process
+tree — 13.6 GB of in-RAM replay buffer, four forked dataloader workers, five MuJoCo envs for
+the in-training rollouts. Two of them exceed this 62 GB box even staggered, and swap sat
+pinned at 8190/8191 MB throughout.
+
+The earlier "two tracks fit at `n_parallel_envs=5`" precedent **does not generalise**: that
+pair had Track A on `lazy_eval=True`, i.e. no env runner at all. Any two arms that both do
+in-training rollouts will OOM. Recorded here because it will bite the next person who
+launches a 2×GPU sweep from the old note.
+
+**Resolution: sequential, via `scripts/run_m3_arms.sh`** (new). It polls for a free box and
+starts B1 the moment A1 exits, so there is no idle gap and no babysitting, and neither arm is
+degraded to fit beside the other — which matters, because both are compared to a baseline
+trained at full width. `training.resume=True` means an interrupted arm resumes from
+`latest.ckpt`. ~23 h per arm, ~46 h for both.
+
+Reference rollout curve for the baseline under the identical protocol, so the arms can be
+read against it as they go:
+
+```
+P1_curve  e0:0.00 e50:0.04 e100:0.26 e150:0.22 e200:0.14 e250:0.18 e300:0.22 e350:0.40
+          e400:0.36 e450:0.34 e500:0.36 e550:0.40 e600:0.40 e650:0.34 e700:0.36 e750:0.30
+```
+
+Note the baseline ran to 1001 epochs and the arms run to 801: top-k therefore selects from 20
+noisy rollout points for the baseline and 16 for each arm, a small advantage to the baseline.
+Say so when quoting the paired delta.
+
+`A1_canon` e0 = 0.00, matching the baseline's own e0. First informative point is e50.

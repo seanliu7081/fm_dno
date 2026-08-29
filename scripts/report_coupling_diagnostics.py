@@ -25,9 +25,27 @@ This reports, on held-out validation observations:
 Works on plain ``FlowPolicy`` checkpoints too (the P0/P1 baselines), so every row of the
 experiment table gets the same treatment.
 
+WHICH ACTIONS COUNT AS "GROUND TRUTH"
+-------------------------------------
+``action_mse_*`` and ``heading_MAE`` are measured against ``batch['action']``.  For every
+arm except reflow that is the demonstration.  A reflow arm trains on
+``ReflowPairDataset``, whose ``action`` is the *donor's distilled endpoint*, so left alone
+those two metrics would be measuring different things on different rows of the same table.
+``--action-source demo`` pulls the actions from the underlying ``ZarrDataset`` instead --
+same windows, same observations, demonstration targets -- which is what makes the column
+comparable.  Default is ``dataset`` so existing invocations are unchanged.
+
+``straightness`` and ``few_step_gap_*`` need no ground truth at all, so they are comparable
+across arms either way; those are the two the few-step plan actually gates on.
+
 Usage:
     MUJOCO_GL=egl python scripts/report_coupling_diagnostics.py \
         -c output/<run>/checkpoints/latest.ckpt -o output/diag/<name>.json
+
+    # comparable MSE / heading columns for a reflow checkpoint
+    MUJOCO_GL=egl python scripts/report_coupling_diagnostics.py \
+        -c output/exp/R1_reflow/seed42/checkpoints/<best>.ckpt \
+        -o output/exp/R1_reflow/seed42/diag.json --action-source demo
 """
 
 from __future__ import annotations
@@ -60,10 +78,25 @@ from oat.symmetry.metrics import (
 from oat.symmetry.so2_chunk import SO2ChunkSpec, chunk_heading, circular_moments
 
 
-def make_samplers(policy):
-    """(encode_obs, velocity, sample_chunk, sample_prior) for FlowPolicy or OrbitFlowPolicy."""
+def make_samplers(policy, obs=None):
+    """(encode_obs, velocity, sample_chunk, sample_prior) for FlowPolicy or OrbitFlowPolicy.
+
+    ``sample_prior`` must return the law the field was actually TRAINED on, or every metric
+    below is measured off-distribution.  For an observation-canonicalized arm the obs-free
+    ``policy.sample_prior`` is the un-canonicalized isotropic draw -- not that law -- so if
+    the policy exposes ``sample_prior_from_obs`` it is used instead, with ``obs`` bound.
+    """
     if hasattr(policy, "sample_chunk"):
-        return (policy.encode_obs, policy.velocity, policy.sample_chunk, policy.sample_prior)
+        prior = policy.sample_prior
+        if obs is not None and hasattr(policy, "sample_prior_from_obs"):
+            print("using policy.sample_prior_from_obs: this arm's source law depends on o, "
+                  "so the obs-free prior would probe the field off its training distribution")
+
+            def prior(B, device=None, dtype=None, generator=None):   # noqa: F811
+                return policy.sample_prior_from_obs(
+                    obs, batch_size=B, device=device, dtype=dtype, generator=generator)
+
+        return (policy.encode_obs, policy.velocity, policy.sample_chunk, prior)
 
     def encode_obs(obs):
         return policy.obs_encoder(obs)
@@ -97,7 +130,11 @@ def make_samplers(policy):
 @click.option("-d", "--device", default="cuda:0")
 @click.option("-b", "--batch-size", default=128, help="validation chunks to probe")
 @click.option("--n-angles", default=8)
-def main(checkpoint, output, device, batch_size, n_angles):
+@click.option("--action-source", default="dataset", type=click.Choice(["dataset", "demo"]),
+              help="'demo' unwraps a ReflowPairDataset to its base ZarrDataset, so "
+                   "action_mse_* / heading_MAE are measured against demonstrations on every "
+                   "arm rather than against each arm's own training target.")
+def main(checkpoint, output, device, batch_size, n_angles, action_source):
     device = torch.device(device)
     policy, cfg = BasePolicy.from_checkpoint(checkpoint, return_configuration=True)
     policy.to(device).eval()
@@ -105,13 +142,20 @@ def main(checkpoint, output, device, batch_size, n_angles):
         p.requires_grad_(False)
 
     spec = getattr(policy, "action_spec", None) or SO2ChunkSpec.libero_osc_pose()
-    encode_obs, velocity, sample_chunk, sample_prior = make_samplers(policy)
 
     dataset = hydra.utils.instantiate(cfg.task.policy.dataset)
     val = dataset.get_validation_dataset()
+    if action_source == "demo" and hasattr(val, "base"):
+        # same windows and the same observations; only 'action' differs
+        print(f"--action-source demo: unwrapping {type(val).__name__} -> "
+              f"{type(val.base).__name__}")
+        val = val.base
     batch = next(iter(DataLoader(val, batch_size=batch_size, shuffle=True, num_workers=2)))
     obs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch["obs"].items()}
     gt = batch["action"].to(device)
+
+    # built after `obs` exists: an arm whose source law depends on o needs it bound in
+    encode_obs, velocity, sample_chunk, sample_prior = make_samplers(policy, obs=obs)
 
     report = {
         "checkpoint": checkpoint,
@@ -119,6 +163,8 @@ def main(checkpoint, output, device, batch_size, n_angles):
                      if "coupling" in cfg.policy else "iid(baseline)"),
         "normalizer_mode": cfg.policy.get("normalizer_mode", "limits(baseline)"),
         "batch_size": int(gt.shape[0]),
+        "action_source": action_source,
+        "action_dataset": type(val).__name__,
     }
 
     with torch.no_grad():
