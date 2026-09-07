@@ -1,0 +1,31 @@
+# D: learned image+state reference. Train it with train_heading_reference first.
+defaults:
+  - train_flowpolicy_canon
+  - _self_
+
+name: train_flowpolicy_learned_canon
+reference_checkpoint: null
+reference_mode: image_state  # image_state | state; policy conditioning always keeps RGB.
+
+policy:
+  _target_: oat.policy.flow_policy_learned_canon.LearnedCanonicalPhaseFlowPolicy
+  reference_checkpoint: ${reference_checkpoint}
+  reference_use: source      # source | condition | both
+  min_reference_confidence: 0.5  # Predicted heading validity, not angular certainty.
+  kappa: 4.0                 # Finite angular dither; inf is an exact-alignment ablation.
+  canon_prob: 1.0
+  reference_model:
+    _target_: oat.perception.heading_predictor.build_heading_predictor
+    _recursive_: false
+    reference_mode: ${reference_mode}
+    shape_meta: ${shape_meta}
+    n_obs_steps: ${n_obs_steps}
+    hidden_dim: 128
+    min_target_confidence: 0.05
+    vision_encoder:
+      _target_: oat.perception.robomimic_vision_encoder.RobomimicRgbEncoder
+      crop_shape: [76, 76]
+      eval_fixed_crop: true
+    state_encoder:
+      _target_: oat.perception.state_encoder.ProjectionStateEncoder
+      out_dim: null

@@ -121,9 +121,16 @@ class CanonicalPhaseFlowPolicy(OrbitFlowPolicy):
         self.min_ref_speed = float(min_ref_speed)
         self.kappa = float(kappa if kappa is not None else float("inf"))
         self.canon_prob = float(canon_prob)
+        if math.isnan(self.kappa) or self.kappa < 0:
+            raise ValueError("kappa must be non-negative (or inf for exact alignment)")
+        if not 0.0 <= self.canon_prob <= 1.0:
+            raise ValueError("canon_prob must be in [0, 1]")
         self.last_canon_diagnostics: Dict[str, float] = {}
-        print(f"  canon     : frame={ref_frame}({ref_key}) min_speed={self.min_ref_speed:g} "
+        print(f"  canon     : frame={self._reference_description()} "
               f"kappa={self.kappa} canon_prob={self.canon_prob}\n")
+
+    def _reference_description(self):
+        return f"{self.ref_frame}({self.ref_key}) min_speed={self.min_ref_speed:g}"
 
     def get_policy_name(self) -> str:
         return "canon_" + super().get_policy_name()
@@ -151,6 +158,12 @@ class CanonicalPhaseFlowPolicy(OrbitFlowPolicy):
         theta = torch.atan2(d[:, 1], d[:, 0])
         return theta, speed > self.min_ref_speed
 
+    def _prepare_observation(self, obs_dict):
+        """Encode observations and obtain the frame once per policy call."""
+        cond = self.encode_obs(obs_dict)
+        theta, valid = self.reference_heading(obs_dict)
+        return cond, theta, valid
+
     # -- the canonicalization ------------------------------------------------------------
 
     def canonicalize_source(
@@ -161,18 +174,27 @@ class CanonicalPhaseFlowPolicy(OrbitFlowPolicy):
     ) -> torch.Tensor:
         """Rotate each source so its chunk heading equals ``theta_ref(o)``.
 
-        This is THE method that must be byte-identical between training and inference; both
-        ``forward`` and ``predict_action`` call it and neither reimplements it.  Nothing here
-        reads ``x1``.
+        This and both policy paths use ``_canonicalize_with_heading``. The policy
+        paths can reuse a precomputed reference without evaluating a visual encoder
+        twice. Nothing in the source transformation reads ``x1``.
         """
         theta_ref, valid = self.reference_heading(obs_dict)
+        return self._canonicalize_with_heading(z, theta_ref, valid, generator=generator)
+
+    def _canonicalize_with_heading(self, z, theta_ref, valid, generator=None):
+        """Shared source map, also usable with a precomputed learned reference."""
+        if theta_ref.shape != (z.shape[0],) or valid.shape != (z.shape[0],):
+            raise ValueError("reference heading and validity must match the source batch")
         theta_ref = theta_ref.to(device=z.device)
         valid = valid.to(device=z.device)
 
         theta_z, _ = chunk_heading(z.float(), self.action_spec)
         phi = wrap_angle(theta_ref - theta_z.to(theta_ref.dtype))
 
-        if math.isfinite(self.kappa):
+        if self.kappa == 0:
+            # VonMises requires positive concentration; zero is the uniform limit.
+            phi = phi + 2 * math.pi * torch.rand_like(phi) - math.pi
+        elif math.isfinite(self.kappa):
             dither = torch.distributions.VonMises(
                 loc=torch.zeros_like(phi),
                 concentration=torch.full_like(phi, self.kappa),
@@ -213,13 +235,21 @@ class CanonicalPhaseFlowPolicy(OrbitFlowPolicy):
         from it is measuring the field off its own training distribution -- correct for an
         off-manifold probe, wrong for a like-for-like comparison against another arm.
         """
-        eef = obs_dict[self.ref_key]
-        B = batch_size or eef.shape[0]
+        theta, valid = self.reference_heading(obs_dict)
+        return self._sample_prior_with_heading(
+            theta, valid, batch_size, device, dtype, generator)
+
+    def _sample_prior_with_heading(
+        self, theta, valid, batch_size=None, device=None, dtype=None, generator=None,
+    ):
+        B = theta.shape[0] if batch_size is None else batch_size
+        if B != theta.shape[0]:
+            raise ValueError("batch_size must match the observation batch")
         z = self.prior_noise_scale * torch.randn(
             B, self.horizon, self.action_dim,
-            device=device or eef.device, dtype=dtype or torch.float32, generator=generator,
+            device=device or theta.device, dtype=dtype or torch.float32, generator=generator,
         )
-        return self.canonicalize_source(z, obs_dict, generator=generator)
+        return self._canonicalize_with_heading(z, theta, valid, generator=generator)
 
     # -- training ------------------------------------------------------------------------
 
@@ -229,10 +259,10 @@ class CanonicalPhaseFlowPolicy(OrbitFlowPolicy):
         B = x1.shape[0]
         device = x1.device
 
-        cond = self.obs_encoder(batch["obs"])                             # (B, To, d)
+        cond, theta, valid = self._prepare_observation(batch["obs"])
 
         z0 = self.prior_noise_scale * torch.randn_like(x1)
-        z0 = self.canonicalize_source(z0, batch["obs"]).to(x1.dtype)
+        z0 = self._canonicalize_with_heading(z0, theta, valid).to(x1.dtype)
 
         t = torch.rand(B, device=device, dtype=x1.dtype)
         t_b = t[:, None, None]
@@ -246,9 +276,9 @@ class CanonicalPhaseFlowPolicy(OrbitFlowPolicy):
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Same source law as training -- that identity is the whole construction."""
-        cond = self.obs_encoder(obs_dict)
-        z = self.sample_prior_from_obs(obs_dict, batch_size=cond.shape[0],
-                                       device=cond.device, dtype=cond.dtype)
+        cond, theta, valid = self._prepare_observation(obs_dict)
+        z = self._sample_prior_with_heading(
+            theta, valid, batch_size=cond.shape[0], device=cond.device, dtype=cond.dtype)
         x = self.sample_chunk(cond, z.to(cond.dtype))
         action_pred = self.normalizer["action"].unnormalize(x)
         return {"action": action_pred[:, : self.n_action_steps], "action_pred": action_pred}
@@ -260,8 +290,9 @@ class CanonicalPhaseFlowPolicy(OrbitFlowPolicy):
         n_steps: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """``z`` is canonicalized before integration, so DNO searches the trained source law."""
-        cond = self.obs_encoder(obs_dict)
-        z = self.canonicalize_source(z.to(dtype=cond.dtype), obs_dict)
+        cond, theta, valid = self._prepare_observation(obs_dict)
+        z = self._canonicalize_with_heading(
+            z.to(device=cond.device, dtype=cond.dtype), theta, valid)
         x = self.sample_chunk(cond, z, n_steps=n_steps)
         action_pred = self.normalizer["action"].unnormalize(x)
         return {"action": action_pred[:, : self.n_action_steps], "action_pred": action_pred}

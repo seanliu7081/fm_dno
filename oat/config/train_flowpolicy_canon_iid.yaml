@@ -1,0 +1,7 @@
+# A: IID source with the same backbone and SO(2) normalization as canonical arms.
+defaults:
+  - train_flowpolicy_canon
+  - _self_
+name: train_flowpolicy_canon_iid
+policy:
+  canon_prob: 0.0

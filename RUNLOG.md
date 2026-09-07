@@ -1503,3 +1503,118 @@ noisy rollout points for the baseline and 16 for each arm, a small advantage to 
 Say so when quoting the paired delta.
 
 `A1_canon` e0 = 0.00, matching the baseline's own e0. First informative point is e50.
+
+## 2026-08-30 — **Gate M3: both constructions are NULL. And the ±0.065 bar was never reachable.**
+
+Both arms trained to 801 epochs, matched protocol, checkpoint selected by the baseline's own
+rule (highest SR in filename, ties to the later epoch). Evaluated at N=10 over 500 episodes
+at `n_parallel_envs=10`, which is required for comparability — `LiberoRunner` builds
+`env_task_names` in batches of that size, so any other value assigns different tasks to
+different episode indices.
+
+| arm | checkpoint | SR@N=10 | paired Δ vs P1 | stderr | p | MDE @ p<0.05 |
+|---|---|---|---|---|---|---|
+| `P1_curve` | ep-0600_sr-0.400 | **0.342** | — | — | — | — |
+| `A1_canon` | ep-0250_sr-0.520 | 0.302 | −0.040 | ±0.091 | 0.671 | **0.206** |
+| `B1_blockwise` | ep-0750_sr-0.380 | 0.334 | −0.008 | ±0.068 | 0.909 | **0.154** |
+
+**Neither arm moves success rate.** Both point estimates are inside their own noise, and both
+are negative, so there is no "suggestive positive" reading available either.
+
+### The methodological finding, which outlives both arms
+
+**The notes' ±0.065 bar is not attainable at one seed on LIBERO-10 for an arm-vs-arm
+comparison.** The measured resolution is ±0.091 and ±0.068, and the MDE is 0.206 and 0.154 —
+two to three times the bar. This experiment could not have detected a 0.065 effect if one had
+existed, and `paired_task_compare`'s own 3-seed projection (0.119, 0.089) says three seeds
+would still not reach it.
+
+The reason is visible in the per-task table: independently trained checkpoints land on wildly
+different per-task profiles. Mean |per-task delta| is 0.224 for A1 against an aggregate delta
+of 0.040 — a reshuffle ratio of 5.6× (17.5× for B1).
+
+| task | P1 | A1 | B1 |
+|---|---|---|---|
+| STUDY_SCENE1 book→caddy | 0.74 | 0.20 | 0.58 |
+| KITCHEN_SCENE3 stove+moka | 0.64 | 0.28 | 0.52 |
+| LIVING_ROOM_SCENE5 two mugs | 0.50 | 0.30 | 0.08 |
+| KITCHEN_SCENE4 bowl→drawer | 0.28 | **0.70** | 0.64 |
+| KITCHEN_SCENE6 mug→microwave | 0.10 | 0.34 | 0.36 |
+| aggregate | 0.342 | 0.302 | 0.334 |
+
+A1 is worst-in-class on the task the baseline is best at and best-in-class on the task the
+baseline is worst at. Contrast the F0 sweep, where the *same* checkpoint at different N gave
+±0.031 — comparing one checkpoint to itself is a fundamentally tighter measurement than
+comparing two training runs. **Any future arm-vs-arm claim on this benchmark needs multiple
+seeds; a single-seed run buys a null and nothing else.**
+
+### Mechanism — and this is where the two arms differ sharply
+
+| metric | P1_curve | A1_canon | B1_blockwise |
+|---|---|---|---|
+| `straightness` | 4.928 | 5.657 | **3.036** |
+| `few_step_gap_N1` | 0.263 | 0.351 | 0.297 |
+| `action_mse_N10` | 0.0534 | **0.0503** | 0.0691 |
+| `orbit_steering_gain` | −0.000 | **−0.060** | −0.030 |
+
+**B1 did exactly what M2 predicted, at the transport level, and it bought nothing.**
+Straightness fell 4.93 → 3.04, a 38% reduction — the offline coupling gain measured in M2
+materialised in the trained field. Success rate moved −0.008 ± 0.068. This is the F0 finding
+confirmed from the opposite direction: F0 showed curvature costs nothing at N≥2, and M3 now
+shows that removing 38% of it buys nothing. The two halves close the loop.
+
+**A1's null has a sharper cause: the network declined the channel.** `orbit_steering_gain` is
+−0.06, i.e. the trained field ignores the source phase entirely. Compare P4, which scored
+1.04 on the same metric and learned the copy eagerly. The difference is exactly the one the
+class docstring anticipated: P4's source phase carried information the observation did *not*
+have (the true target heading), so reading it paid; A1's source phase carries only what `o`
+already contains, so there is nothing to gain by reading it, and the network learned the
+observation route instead. **The representation bet was stated as a bet and it lost** — the
+construction is admissible (verified `q_o = s_o` byte-identically), the frame is informative
+(R1 0.593), and the network still did not use it.
+
+### One caveat that is not resolved, and should not be papered over
+
+**B1 may be undertrained.** Its rollout curve is still climbing where the baseline had long
+plateaued:
+
+```
+B1  e0:0.00 e50:0.00 e100:0.00 e150:0.04 e200:0.00 e250:0.06 e300:0.06 e350:0.04 e400:0.06
+    e450:0.10 e500:0.16 e550:0.24 e600:0.22 e650:0.22 e700:0.26 e750:0.38 e800:0.26
+P1  e0:0.00 e50:0.04 e100:0.26 ... plateau 0.30-0.40 from e350
+```
+
+B1 sat at ~0 for 150 epochs and only reached the baseline's band around e750. That is a real
+effect of the coupling, and the likely reason is the class-(3) caveat biting exactly as
+predicted: blockwise doubled the transport gain *and* doubled the train/test source mismatch
+(joint norm drift 1.3–1.7 versus 0.0 for the joint permutation, measured in M2). It trains on
+a source law further from the `N(0,I)` inference samples from, so it needs longer to overcome
+the mismatch. **B1's null is therefore "no effect at 801 epochs", not "no effect".** A
+1501-epoch rerun would settle it; at ~23 h that is the cheapest open question left.
+
+A1 needs no such caveat — it peaked at e250 and its curve is as converged as the baseline's.
+
+### Where this leaves the notes
+
+§1's admissibility criterion stands as the contribution: it retro-derives P4 (0.008) and P5
+(0.000), it predicted that A would be *sound* (verified), and it predicted that B would remain
+class-(3) with gain and bias moving together (measured, and visible in B1's slow start).
+What it does not do is predict a success-rate gain, and none appeared. Combined with F0, the
+project's consistent finding across seven arms is that **training-time geometry has weak
+purchase on closed-loop success at this operating point** — the transport metrics move, by
+design and on demand, and the task does not follow.
+
+## 2026-08-30 — B1 closed at 801 epochs by decision; run summary written
+
+The 1501-epoch rerun that would have settled B1's undertraining caveat was **offered and
+declined** ("750 epochs for b1 is enough"). B1's result therefore stands as **"no effect at
+801 epochs, with its rollout curve still rising"** — a stated limitation, not a resolved one.
+Nothing further is queued; both GPUs are idle.
+
+`output/audit/m2_blockwise.json` was regenerated so its `gate_m2` block matches the corrected
+gate logic (the first write predated the fix and carried the old schema). The underlying
+`results` are byte-identical on rerun, as the per-variant seeding intends.
+
+Standalone write-up: **`RUN_SUMMARY.md`** — F0 + M1/M2/M3, the four findings, the per-task
+tables, the methodological notes (resolution, `n_parallel_envs`, memory), and the file
+inventory. `RUNLOG.md` remains the chronological record.

@@ -32,6 +32,10 @@ class BasePolicy(ModuleAttrMixin):
     def get_optimizer(self, *args, **kwargs):
         return torch.optim.AdamW(self.parameters(), *args, **kwargs)
 
+    def prepare_for_training(self) -> None:
+        """Initialize auxiliary modules after checkpoint resume, before DDP wrapping."""
+        pass
+
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         obs_dict:

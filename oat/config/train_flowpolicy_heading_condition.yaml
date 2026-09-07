@@ -1,0 +1,7 @@
+# E: direction as an additional condition; source stays IID.
+defaults:
+  - train_flowpolicy_learned_canon
+  - _self_
+name: train_flowpolicy_heading_condition
+policy:
+  reference_use: condition

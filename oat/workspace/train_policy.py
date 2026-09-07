@@ -128,6 +128,12 @@ class TrainPolicyWorkspace(BaseWorkspace):
                     accelerator.print(f"Already trained for {self.epoch} epochs. Exiting.")
                     return
                 
+        # Auxiliary artifacts may already be embedded in a resumed checkpoint.
+        # Initialize them only after resume, and before DDP/EMA see module topology.
+        self.model.prepare_for_training()
+        if self.ema_model is not None:
+            self.ema_model.prepare_for_training()
+
         # prepare with accelerator
         (
             train_dataloader,

@@ -1,0 +1,7 @@
+# B: observed EEF-motion frame, with the same finite kappa as learned arms.
+defaults:
+  - train_flowpolicy_canon
+  - _self_
+name: train_flowpolicy_canon_soft
+policy:
+  kappa: 4.0
