@@ -46,6 +46,9 @@ class FlowPolicy(BasePolicy):
         # flow-matching params
         num_inference_steps: int = 10,
         prior_noise_scale: float = 1.0,
+        # Optional action backbone; the default preserves existing checkpoints.
+        backbone_type: str = "transformer",
+        backbone_kwargs: Optional[Dict] = None,
     ):
         super().__init__()
 
@@ -64,10 +67,9 @@ class FlowPolicy(BasePolicy):
                 obs_ports.append(key)
 
         # ── Velocity field backbone ──────────────────────────────────────
-        # The conditioning sequence is just the To observation tokens.
-        # causal_attn=False -> no causal/memory mask: the whole action chunk is
-        # denoised jointly with full cross-attention to all conditioning tokens.
-        model = TransformerForDiffusion(
+        # Every backbone predicts a velocity for the complete action chunk.
+        # Keep the legacy constructor and parameter names unchanged by default.
+        model_kwargs = dict(
             input_dim=action_dim,
             output_dim=action_dim,
             horizon=horizon,
@@ -78,11 +80,35 @@ class FlowPolicy(BasePolicy):
             n_emb=embed_dim,
             p_drop_emb=dropout,
             p_drop_attn=dropout,
-            causal_attn=False,
-            time_as_cond=True,
-            obs_as_cond=True,
         )
+        extra_kwargs = dict(backbone_kwargs or {})
+        overlap = model_kwargs.keys() & extra_kwargs.keys()
+        if overlap:
+            raise ValueError(
+                "backbone_kwargs cannot override shared model dimensions/settings: "
+                + ", ".join(sorted(overlap))
+            )
+        if backbone_type == "transformer":
+            if extra_kwargs:
+                raise ValueError("backbone_kwargs are not supported for the legacy transformer")
+            model = TransformerForDiffusion(
+                **model_kwargs, causal_attn=False, time_as_cond=True, obs_as_cond=True,
+            )
+        elif backbone_type == "mixed_dit":
+            from oat.model.flow.mixed_dit import MixedAdaLNZeroTransformer
 
+            model = MixedAdaLNZeroTransformer(**model_kwargs, **extra_kwargs)
+        elif backbone_type == "starvla_dit":
+            from oat.model.flow.starvla_dit import StarVLAFlowTransformer
+
+            model = StarVLAFlowTransformer(**model_kwargs, **extra_kwargs)
+        else:
+            raise ValueError(
+                f"Unknown backbone_type {backbone_type!r}; expected "
+                "'transformer', 'mixed_dit', or 'starvla_dit'"
+            )
+
+        self.backbone_type = backbone_type
         self.modalities = modalities
         self.obs_key_shapes = obs_key_shapes
         self.obs_ports = obs_ports
@@ -109,7 +135,7 @@ class FlowPolicy(BasePolicy):
             f"  obs enc : {num_obs_params / 1e6:.1f}M "
             f"({num_trainable_obs / max(num_obs_params, 1):.5%} trainable)\n"
             f"  policy  : {num_model_params / 1e6:.1f}M\n"
-            f"  cond_len={n_obs_steps}, flow_steps={num_inference_steps}, "
+            f"  backbone={backbone_type}, cond_len={n_obs_steps}, flow_steps={num_inference_steps}, "
             f"sigma={prior_noise_scale}\n"
         )
 

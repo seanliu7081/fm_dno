@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import multiprocessing
+import signal
 import sys
 import time
+import traceback
 from copy import deepcopy
 from enum import Enum
 from multiprocessing import Queue
 from multiprocessing.connection import Connection
+from queue import Empty
 from typing import Any, Callable, Sequence
 
 import numpy as np
@@ -140,32 +143,38 @@ class AsyncVectorEnv(VectorEnv):
 
         self.parent_pipes, self.processes = [], []
         self.error_queue = ctx.Queue()
-        target = worker or _async_worker
-        with clear_mpi_env_vars():
-            for idx, env_fn in enumerate(env_fns):
-                parent_pipe, child_pipe = ctx.Pipe()
-                process = ctx.Process(
-                    target=target,
-                    name=f"Worker<{type(self).__name__}>-{idx}",
-                    args=(
-                        idx,
-                        CloudpickleWrapper(env_fn),
-                        child_pipe,
-                        parent_pipe,
-                        _obs_buffer,
-                        self.error_queue,
-                    ),
-                )
-
-                self.parent_pipes.append(parent_pipe)
-                self.processes.append(process)
-
-                process.daemon = daemon
-                process.start()
-                child_pipe.close()
-
         self._state = AsyncState.DEFAULT
-        self._check_spaces()
+        try:
+            target = worker or _async_worker
+            with clear_mpi_env_vars():
+                for idx, env_fn in enumerate(env_fns):
+                    parent_pipe, child_pipe = ctx.Pipe()
+                    process = ctx.Process(
+                        target=target,
+                        name=f"Worker<{type(self).__name__}>-{idx}",
+                        args=(
+                            idx,
+                            CloudpickleWrapper(env_fn),
+                            child_pipe,
+                            parent_pipe,
+                            _obs_buffer,
+                            self.error_queue,
+                        ),
+                    )
+
+                    self.parent_pipes.append(parent_pipe)
+                    self.processes.append(process)
+
+                    process.daemon = daemon
+                    try:
+                        process.start()
+                    finally:
+                        child_pipe.close()
+
+            self._check_spaces()
+        except BaseException:
+            self.close(terminate=True)
+            raise
 
     @property
     def np_random_seed(self) -> tuple[int, ...]:
@@ -435,8 +444,8 @@ class AsyncVectorEnv(VectorEnv):
                 self._state.value,
             )
 
-        for i, pipe in enumerate(self.parent_pipes):
-            pipe.send(("_call", (name, args_list[i], kwargs_list[i])))
+        for i in range(self.num_envs):
+            self._send_to_worker(i, ("_call", (name, args_list[i], kwargs_list[i])))
         self._state = AsyncState.WAITING_CALL
 
         # receive
@@ -453,7 +462,9 @@ class AsyncVectorEnv(VectorEnv):
                 f"The call to `call_wait` has timed out after {timeout} second(s)."
             )
 
-        results, successes = zip(*[pipe.recv() for pipe in self.parent_pipes])
+        results, successes = zip(*[
+            self._recv_from_worker(i) for i in range(self.num_envs)
+        ])
         self._raise_if_errors(successes)
         self._state = AsyncState.DEFAULT
 
@@ -587,26 +598,44 @@ class AsyncVectorEnv(VectorEnv):
                 )
                 function = getattr(self, f"{self._state.value}_wait")
                 function(timeout)
-        except multiprocessing.TimeoutError:
+        except Exception:
+            # Cleanup must still finish if a pending worker call failed.
             terminate = True
+
+        if not terminate:
+            closing_pipes = []
+            for pipe, process in zip(self.parent_pipes, self.processes):
+                if (pipe is not None) and (not pipe.closed) and process.is_alive():
+                    try:
+                        pipe.send(("close", None))
+                        closing_pipes.append(pipe)
+                    except (EOFError, OSError):
+                        pass  # A worker can exit between is_alive and send.
+            for pipe in closing_pipes:
+                try:
+                    if timeout is not None and not pipe.poll(timeout):
+                        terminate = True
+                        break
+                    pipe.recv()
+                except (EOFError, OSError):
+                    pass
 
         if terminate:
             for process in self.processes:
                 if process.is_alive():
                     process.terminate()
-        else:
-            for pipe in self.parent_pipes:
-                if (pipe is not None) and (not pipe.closed):
-                    pipe.send(("close", None))
-            for pipe in self.parent_pipes:
-                if (pipe is not None) and (not pipe.closed):
-                    pipe.recv()
 
         for pipe in self.parent_pipes:
             if pipe is not None:
                 pipe.close()
         for process in self.processes:
-            process.join()
+            if process.pid is not None:
+                process.join(timeout=1 if terminate else timeout)
+                if process.is_alive():
+                    process.kill()
+                    process.join()
+        self.error_queue.close()
+        self.error_queue.join_thread()
 
     def _poll_pipe_envs(self, timeout: int | None = None):
         self._assert_is_running()
@@ -628,10 +657,12 @@ class AsyncVectorEnv(VectorEnv):
         self._assert_is_running()
         spaces = (self.single_observation_space, self.single_action_space)
 
-        for pipe in self.parent_pipes:
-            pipe.send(("_check_spaces", spaces))
+        for index in range(self.num_envs):
+            self._send_to_worker(index, ("_check_spaces", spaces))
 
-        results, successes = zip(*[pipe.recv() for pipe in self.parent_pipes])
+        results, successes = zip(*[
+            self._recv_from_worker(index) for index in range(self.num_envs)
+        ])
         self._raise_if_errors(successes)
         same_observation_spaces, same_action_spaces = zip(*results)
 
@@ -652,14 +683,66 @@ class AsyncVectorEnv(VectorEnv):
                 f"Trying to operate on `{type(self).__name__}`, after a call to `close()`."
             )
 
+    def _connection_error(self, index, operation, error):
+        self._state = AsyncState.DEFAULT
+        process = self.processes[index]
+        # Refresh the exit status after an EOF from a worker that just exited.
+        process.join(timeout=0.05)
+        # An initialization error can arrive before the first parent send.
+        # Preserve its original Python exception instead of reporting BrokenPipe.
+        try:
+            worker_error = self.error_queue.get(timeout=0.1)
+        except Empty:
+            pass
+        else:
+            self._raise_worker_exception(worker_error)
+
+        exitcode = process.exitcode
+        signal_name = ""
+        if exitcode is not None and exitcode < 0:
+            try:
+                signal_name = f", signal={signal.Signals(-exitcode).name}"
+            except ValueError:
+                pass
+        raise RuntimeError(
+            f"AsyncVectorEnv Worker-{index} connection failed during {operation}: "
+            f"pid={process.pid}, exitcode={exitcode}{signal_name}. "
+            "The worker may have been killed or crashed in native environment/rendering code; "
+            "check worker stderr and system logs for the original cause."
+        ) from error
+
+    def _send_to_worker(self, index, message):
+        try:
+            self.parent_pipes[index].send(message)
+        except (EOFError, OSError) as error:
+            self._connection_error(index, f"send {message[0]}", error)
+
+    def _recv_from_worker(self, index):
+        try:
+            return self.parent_pipes[index].recv()
+        except (EOFError, OSError) as error:
+            self._connection_error(index, "receive", error)
+
+    @staticmethod
+    def _raise_worker_exception(error):
+        index, exctype, value = error[:3]
+        exception = value if isinstance(value, BaseException) else exctype(value)
+        if len(error) > 3:
+            raise exception from RuntimeError(
+                f"Original traceback from Worker-{index}:\n{error[3]}"
+            )
+        raise exception
+
     def _raise_if_errors(self, successes: list[bool] | tuple[bool]):
         if all(successes):
             return
 
         num_errors = self.num_envs - sum(successes)
         assert num_errors > 0
+        self._state = AsyncState.DEFAULT
         for i in range(num_errors):
-            index, exctype, value = self.error_queue.get()
+            error = self.error_queue.get()
+            index, exctype, value = error[:3]
 
             logger.error(
                 f"Received the following error from Worker-{index}: {exctype.__name__}: {value}"
@@ -671,7 +754,7 @@ class AsyncVectorEnv(VectorEnv):
 
             if i == num_errors - 1:
                 logger.error("Raising the last exception back to the main process.")
-                raise exctype(value)
+                self._raise_worker_exception(error)
 
     def __del__(self):
         """On deleting the object, checks that the vector environment is closed."""
@@ -687,14 +770,14 @@ def _async_worker(
     shared_memory: bool,
     error_queue: Queue,
 ):
-    env = env_fn()
-    observation_space = env.observation_space
-    action_space = env.action_space
-    autoreset = False
-
+    env = None
     parent_pipe.close()
 
     try:
+        env = env_fn()
+        observation_space = env.observation_space
+        action_space = env.action_space
+        autoreset = False
         while True:
             command, data = pipe.recv()
 
@@ -759,7 +842,14 @@ def _async_worker(
                     f"Received unknown command `{command}`. Must be one of [`reset`, `step`, `close`, `_call`, `_setattr`, `_check_spaces`]."
                 )
     except (KeyboardInterrupt, Exception):
-        error_queue.put((index,) + sys.exc_info()[:2])
-        pipe.send((None, False))
+        error_queue.put((index,) + sys.exc_info()[:2] + (traceback.format_exc(),))
+        try:
+            pipe.send((None, False))
+        except (EOFError, OSError):
+            pass  # Parent cleanup may already have closed its connection.
     finally:
-        env.close()
+        try:
+            if env is not None:
+                env.close()
+        finally:
+            pipe.close()

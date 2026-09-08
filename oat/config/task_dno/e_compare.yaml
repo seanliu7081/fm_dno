@@ -1,0 +1,11 @@
+# Frozen E checkpoint; shared seeds and task geometry for all three versions.
+expected_source: E
+modes: baseline,best_of_k,dno
+episodes: 20
+max_episode_steps: 550
+num_candidates: 4
+num_grad_steps: 3
+lr: 0.05
+trust_weight: 0.01
+trust_radius: 0.5
+teacher_mode: dno

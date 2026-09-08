@@ -155,3 +155,47 @@ improvement. Useful next experiments are direction-error uncertainty (beyond hea
 validity), multimodal directional mixtures, execution-window heading labels, joint
 reference/flow fine-tuning, and generation in a transformed action frame. Each changes
 the hypothesis being tested and should follow the frozen-reference comparison.
+
+## Recovering from a rollout worker failure
+
+A `BrokenPipeError` in `LiberoRunner.run -> call_each` means an environment worker
+has exited before the parent could send its next command. It does not identify the
+reason the worker exited. W&B and PyTorch deprecation warnings are not evidence of
+that cause. Inspect `logs.json` rather than the last retained terminal progress bar:
+progress bars can still display an earlier epoch after a long run.
+
+LIBERO workers now start with `spawn` when a rollout begins and are closed when that
+rollout finishes, including on exceptions. They no longer retain simulator and EGL
+resources during intervening training epochs. The DNO runner uses the same lifecycle.
+Worker failures report the process identity/exit code or the Python traceback when
+available; a native crash or an OS kill may still require system logs to diagnose.
+
+For the E run in `output/learned_canon/condition/seed42`, the 2026-09-07 logs reached
+epoch 200 before rollout failed. The last completed rollout was epoch 150, with a
+mean success rate of 0.186. `checkpoints/latest.ckpt` contains epoch 190, including
+the model, EMA, optimizer, and frozen heading reference. The existing workspace
+resumes at the stored epoch number (so the saved epoch is replayed); it does not
+restore the failed epoch 200 from W&B logs.
+
+Resume in the same output directory with fewer concurrent simulators:
+
+```bash
+conda activate oat
+CUDA_VISIBLE_DEVICES=1 MUJOCO_EGL_DEVICE_ID=1 MUJOCO_GL=egl \
+python scripts/run_workspace.py \
+  --config-name=train_flowpolicy_heading_condition \
+  reference_checkpoint=output/heading_reference/image_state/checkpoints/best.pt \
+  seed=42 training.seed=42 task.policy.dataset.seed=42 \
+  training.resume=true \
+  task.policy.lazy_eval=false training.rollout_every=50 \
+  task.policy.env_runner.n_parallel_envs=10 \
+  hydra.run.dir=output/learned_canon/condition/seed42
+```
+
+The installed robosuite EGL backend interprets `MUJOCO_EGL_DEVICE_ID=1` as system
+GPU 1. PyTorch sees that same device as `cuda:0` under `CUDA_VISIBLE_DEVICES=1`.
+Keep the output directory to load `latest.ckpt`; a new directory starts a new run.
+Reducing parallelism from 20 to 10 keeps the 500-episode evaluation and LIBERO-10
+task/seed schedule, while lowering peak simulator resource demand. Recreated workers
+restart their seeded random streams each evaluation; compare future policies with
+this same runner version rather than assuming identical trajectories to old runs.

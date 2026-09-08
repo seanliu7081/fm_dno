@@ -1,0 +1,8 @@
+# Optional action backbone with the existing observation-conditioned flow objective.
+defaults:
+  - train_flowpolicy
+  - _self_
+
+name: train_flowpolicy_mixed_dit
+policy:
+  backbone_type: mixed_dit

@@ -1,0 +1,7 @@
+# Pipeline check only: 16 steps is too short to measure pick-and-place success.
+modes: baseline,best_of_k,dno
+episodes: 2
+max_episode_steps: 16
+num_candidates: 2
+num_grad_steps: 1
+teacher_mode: dno

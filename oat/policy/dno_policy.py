@@ -9,7 +9,7 @@ change to any existing file.
 
 ONE HARD CONSTRAINT
 -------------------
-``LiberoRunner.run`` is decorated with ``@torch.inference_mode()`` and wraps the policy call
+``LiberoRunner._run`` is decorated with ``@torch.inference_mode()`` and wraps the policy call
 in another ``inference_mode`` block.  Stage 1 of orbit DNO (the angular grid search) is pure
 forward evaluation and runs fine there.  Stage 2 (gradient descent through the sampler)
 cannot: tensors created under inference mode are not usable in an autograd graph.

@@ -324,6 +324,11 @@ HYDRA_FULL_ERROR=1 MUJOCO_GL=egl accelerate launch \
     training.num_epochs=5001 training.num_demo=500 task.policy.lazy_eval=false
 ```
 
+The optional **mixed adaLN-Zero** and **StarVLA / GR00T-style** action backbones
+each have plain-flow and learned-heading-conditioned configs. See
+[flow backbone variants](docs/flow_backbones.md) for the four configs, architecture
+differences, reference-checkpoint setup, and training commands.
+
 **`train_flowpolicy_with_enriched_past`** — the same flow policy with Past2Next's enriched-past
 conditioning, isolating that idea from the discrete bottleneck. Uses `libero10_with_past`.
 

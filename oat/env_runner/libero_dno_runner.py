@@ -1,14 +1,14 @@
 """
 A LIBERO runner that lets the policy use gradients.
 
-``LiberoRunner.run`` is ``@torch.inference_mode()`` and additionally wraps the policy call
+``LiberoRunner._run`` is ``@torch.inference_mode()`` and additionally wraps the policy call
 in ``with torch.inference_mode():``.  That is correct and fast for a normal policy, and it
 makes stage 2 of orbit DNO impossible -- tensors created under inference mode cannot enter
 an autograd graph, so backpropagating through the sampler raises at the first op.
 
-This subclass overrides ``run`` with the same rollout loop minus the inference-mode guards.
+This subclass overrides ``_run`` with the same rollout loop minus the inference-mode guards.
 Everything else -- env construction, chunking, seeding, video capture, logging -- is
-inherited untouched, so a DNO rollout is comparable to a stock rollout episode for episode.
+inherited, including worker creation and cleanup for each evaluation.
 
 Only needed when ``OrbitDNO.n_grad_steps > 0``.  Stage-1-only DNO (the orbit grid search) is
 pure forward evaluation and runs under the stock runner; prefer that first, since it is also
@@ -36,7 +36,7 @@ from oat.policy.base_policy import BasePolicy
 class OrbitDnoLiberoRunner(LiberoRunner):
     """``LiberoRunner`` with the rollout loop run under ``torch.enable_grad()``."""
 
-    def run(self, policy: BasePolicy, **kwargs):
+    def _run(self, policy: BasePolicy, **kwargs):
         device = policy.device
         dtype = policy.dtype
         policy_name = policy.get_policy_name()

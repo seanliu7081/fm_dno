@@ -25,8 +25,7 @@ def maybe_to_torch(x, device, dtype):
         return x
     
 class LiberoRunner(BaseRunner):
-    # import multiprocessing as mp
-    # mp.set_start_method('spawn', force=True)
+    """Create simulator workers only for the duration of each rollout evaluation."""
 
     def __init__(self,
         output_dir,
@@ -53,6 +52,7 @@ class LiberoRunner(BaseRunner):
             'robot0_gripper_qpos',
         ],
         max_episode_steps: int = 550,
+        multiprocessing_context: str = "spawn",
     ):
         super().__init__(output_dir)
 
@@ -140,10 +140,7 @@ class LiberoRunner(BaseRunner):
         assert len(env_fns) == n_parallel_envs
         assert len(env_init_fn_dills) == n_test
 
-        # For each process the OpenGL context can only be initialized once
-        # Since AsyncVectorEnv uses fork to create worker process,
-        # a separate env_fn that does not create OpenGL context (enable_render=False)
-        # is needed to initialize spaces.
+        # Inspect spaces without creating an OpenGL context in the training process.
         def dummy_env_fn():
             return MultiStepWrapper(
                 VideoRecordingWrapper(
@@ -173,13 +170,10 @@ class LiberoRunner(BaseRunner):
                 reward_agg_method='max'
             )
 
-        env = AsyncVectorEnv(env_fns, shared_memory=False,
-            dummy_env_fn=dummy_env_fn
-            # context='spawn',
-        )  # NOTE: turn off shared_memory to use Text space
-
         # attr assignment
-        self.env = env
+        self.env = None
+        self.dummy_env_fn = dummy_env_fn
+        self.multiprocessing_context = multiprocessing_context
         self.task_name = task_name
         self.env_fns = env_fns
         self.env_seeds = env_seeds
@@ -190,12 +184,27 @@ class LiberoRunner(BaseRunner):
         self.max_episode_steps = max_episode_steps
         self.tqdm_interval_sec = tqdm_interval_sec
 
-    @torch.inference_mode()
     def run(self, 
         policy: BasePolicy,
         # policy inference args
         **kwargs,
     ):
+        # Workers would otherwise keep MuJoCo / EGL resources throughout the many
+        # training epochs between evaluations. Spawn also avoids inheriting the
+        # training process's initialized CUDA and background-thread state.
+        self.close()
+        try:
+            self.env = AsyncVectorEnv(
+                self.env_fns, shared_memory=False,
+                dummy_env_fn=self.dummy_env_fn,
+                context=self.multiprocessing_context,
+            )
+            return self._run(policy, **kwargs)
+        finally:
+            self.close()
+
+    @torch.inference_mode()
+    def _run(self, policy: BasePolicy, **kwargs):
         device = policy.device
         dtype = policy.dtype
         policy_name = policy.get_policy_name()
@@ -307,4 +316,6 @@ class LiberoRunner(BaseRunner):
         return log_data
 
     def close(self):
-        self.env.close()
+        env, self.env = self.env, None
+        if env is not None:
+            env.close(timeout=5)
