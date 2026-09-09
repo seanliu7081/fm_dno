@@ -1,5 +1,7 @@
 # Past2Next
 
+Current heading / flow / DNO research: [长期项目上下文与实验记录](docs/project_context.md).
+
 Two-stage discrete action modelling for robot manipulation, benchmarked on **LIBERO-10**.
 
 1. **Stage 1 — action tokenizer.** An action-only autoencoder with a discrete bottleneck (FSQ)

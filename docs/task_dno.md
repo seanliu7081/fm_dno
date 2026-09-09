@@ -1,5 +1,14 @@
 # Task-guided DNO for E/F
 
+> **Artifact availability update (2026-09-09):** The epoch-200 E checkpoint used by
+> the historical commands and pilot below is no longer present at its original path;
+> no matching named copy was found in the repository. Its trained initializer requires
+> that exact base-checkpoint SHA-256 and cannot use epoch 300 or `latest.ckpt` instead.
+> Restore the original base file, or collect new teacher data and train an initializer
+> for a newly archived base. See [the lifetime project context](project_context.md#42-e-主策略训练快照)
+> for the dated training snapshot and current artifact status. Historical results below
+> retain their original model identity.
+
 These policy wrappers add task-directed initial-noise search to an already trained
 E or F checkpoint. They are independent of `OrbitDNO`; the base policy, its visual
 encoder, heading predictor, and normalizers remain frozen. No base-policy retraining
