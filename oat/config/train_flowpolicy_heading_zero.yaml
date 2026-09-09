@@ -1,0 +1,70 @@
+# Full-data version of the shared-heading zero-jitter mini experiment.
+# Uses predicted headings for BOTH conditioning and the translation-XY source.
+# No standalone/frozen heading reference and no future-label source inputs.
+defaults:
+  - train_flowpolicy
+  - _self_
+
+name: train_flowpolicy_heading_zero
+
+policy:
+  _target_: oat.policy.flow_policy_heading_zero.HeadingZeroFlowPolicy
+  heading_mode: condition
+  heading_hidden_dim: 128
+  heading_horizon: ${horizon}
+  heading_loss_weight: 0.1
+  validity_loss_weight: 0.1
+  min_target_confidence: 0.05
+  source_mode: heading
+  source_jitter: zero
+  source_vector_blocks: [[0, 1]]
+  min_source_confidence: 0.5
+  # heading_xy_rms is fitted from the selected training episodes by the dataset
+  # hook, and is stored as a policy buffer in regular workspace checkpoints.
+  obs_encoder:
+    vision_encoder:
+      eval_fixed_crop: true
+
+optimizer:
+  # Flow / shared encoder rates inherit 5e-5 / 1e-5 from train_flowpolicy.
+  heading_lr: 1.0e-3
+
+training:
+  # Sample from the full training-window pool, not the 4,000-window cache.
+  # Preserve the full-training budget; evaluate simulator success every 50 epochs.
+  num_epochs: 5001
+  rollout_every: 50
+  # 'constant' ignores lr_warmup_steps; explicitly enable the mini's 100-step
+  # warmup, using the standard workspace scheduler's zero-based step convention.
+  lr_scheduler: constant_with_warmup
+  lr_warmup_steps: 100
+  max_grad_norm: 1.0
+  max_train_steps: null
+  max_val_steps: null
+  max_reconst_steps: null
+
+task:
+  policy:
+    # Run simulator success-rate evaluation at training.rollout_every.
+    lazy_eval: false
+    env_runner:
+      # Bound simulator memory alongside the full RGB dataset and training workers.
+      n_parallel_envs: 10
+    dataset:
+      _target_: oat.dataset.heading_zarr_dataset.HeadingZarrDataset
+      # Keep the data split fixed when changing the model training seed.
+      seed: 42
+      rgb_keys: [agentview_rgb, robot0_eye_in_hand_rgb]
+
+checkpoint:
+  # Available with or without simulator rollouts. This is full-chunk raw MSE,
+  # the standard workspace reconstruction metric, not the mini prefix-8 metric.
+  topk:
+    monitor_key: test_reconst_mse
+    mode: min
+    k: 3
+    format_str: "ep-{epoch:04d}_mse-{test_reconst_mse:.6f}.ckpt"
+
+logging:
+  name: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_seed${seed}
+  tags: ["${name}", "${task_name}", "joint_heading", "predicted_xy_prior", "zero_jitter"]

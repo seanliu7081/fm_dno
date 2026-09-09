@@ -1,14 +1,16 @@
 """Matched ordinary-flow ablations with a heading head on shared observations.
 
-All modes retain the baseline action normalizer and IID Gaussian source. Future
-actions supervise the heading head only; inference always uses observations.
+All modes retain the baseline action normalizer. The optional heading source
+rotates realized noise in raw action coordinates before normalizing it again.
+Future actions supervise the heading head only; inference uses observations.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -19,6 +21,7 @@ from oat.policy.flow_policy import FlowPolicy
 
 
 HEADING_MODES = ("baseline", "auxiliary", "condition")
+SOURCE_MODES = ("iid", "heading")
 
 
 class SharedHeadingObservationEncoder(BaseObservationEncoder):
@@ -105,7 +108,14 @@ start at zero, so the initial flow prediction is identical in all three modes.
 
 ``heading_xy_rms`` must be fitted on training episodes only and is independent of
 the ordinary per-coordinate action normalizer. It sets the validity-label scale;
-it does not alter either actions or flow noise.
+it does not alter either actions or flow noise. ``source_mode="heading"`` adds
+a separately selected source transform, with its heading input detached. Its
+local angular RNG does not consume global NumPy or PyTorch random draws; pass
+explicit ``angular_jitter`` to reproduce a particular draw after checkpoint load.
+``source_jitter="zero"`` disables angular dither in both training and inference;
+an explicit ``angular_jitter`` still overrides it for controlled diagnostics.
+Source settings are constructor metadata, not new state-dict tensors, so old IID
+checkpoints still load strictly.
 """
 
     def __init__(
@@ -122,6 +132,12 @@ it does not alter either actions or flow noise.
         min_target_confidence: float = 0.05,
         heading_loss_weight: float = 0.1,
         validity_loss_weight: float = 0.1,
+        source_mode: str = "iid",
+        source_kappa: float = 4.0,
+        source_jitter: str = "vonmises",
+        min_source_confidence: float = 0.5,
+        source_seed: int = 0,
+        source_vector_blocks: Optional[Sequence[Sequence[int]]] = None,
         **kwargs,
     ):
         heading_horizon = horizon if heading_horizon is None else int(heading_horizon)
@@ -150,6 +166,18 @@ it does not alter either actions or flow noise.
         self.validity_loss_weight = float(validity_loss_weight)
         self.register_buffer("heading_xy_rms", torch.tensor(1.0))
         self.set_heading_xy_rms(heading_xy_rms)
+        if not math.isfinite(source_kappa) or source_kappa < 0:
+            raise ValueError("source_kappa must be finite and non-negative")
+        if not math.isfinite(min_source_confidence) or not 0 <= min_source_confidence <= 1:
+            raise ValueError("min_source_confidence must be in [0, 1]")
+        self.source_kappa = float(source_kappa)
+        self.set_source_jitter(source_jitter)
+        self.min_source_confidence = float(min_source_confidence)
+        if source_vector_blocks is None:
+            source_vector_blocks = ((0, 1), (3, 4)) if self.action_dim >= 5 else ((0, 1),)
+        self.set_source_vector_blocks(source_vector_blocks)
+        self.set_source_mode(source_mode)
+        self.set_source_seed(source_seed)
 
     @property
     def heading_mode(self):
@@ -157,6 +185,129 @@ it does not alter either actions or flow noise.
 
     def set_heading_mode(self, mode):
         self.obs_encoder.set_mode(mode)
+
+    def set_source_mode(self, mode):
+        if mode not in SOURCE_MODES:
+            raise ValueError(f"source_mode must be one of {SOURCE_MODES}, got {mode!r}")
+        self.source_mode = mode
+
+    def set_source_vector_blocks(self, blocks):
+        """Select nonoverlapping raw 2D blocks; translation XY must be included."""
+        blocks = tuple(tuple(block) for block in blocks)
+        if not blocks or any(len(block) != 2 for block in blocks):
+            raise ValueError("source_vector_blocks must contain pairs of action indices")
+        indices = [index for block in blocks for index in block]
+        if any(not isinstance(index, (int, np.integer)) or not 0 <= index < self.action_dim
+               for index in indices):
+            raise ValueError("source_vector_blocks indices must be integers within action dimensions")
+        if len(indices) != len(set(indices)):
+            raise ValueError("source_vector_blocks must not overlap or repeat indices")
+        if (0, 1) not in blocks:
+            raise ValueError("source_vector_blocks must include translation XY (0, 1)")
+        self.source_vector_blocks = tuple(tuple(int(index) for index in block) for block in blocks)
+
+    def set_source_jitter(self, mode):
+        if mode not in ("vonmises", "zero"):
+            raise ValueError("source_jitter must be 'vonmises' or 'zero'")
+        self.source_jitter = mode
+
+    def set_source_seed(self, seed):
+        """Reset the private CPU angular RNG without affecting any global RNG."""
+        self._source_rng = np.random.default_rng(seed)
+
+    def _transform_source(self, z, prediction, angular_jitter=None):
+        if self.source_mode == "iid":
+            return z, torch.zeros(z.shape[0], device=z.device, dtype=torch.bool)
+        if z.ndim != 3 or z.shape[-1] != self.action_dim or z.shape[1] != self.horizon:
+            raise ValueError("source must have shape (B, horizon, action_dim)")
+        if prediction["theta"].shape != (z.shape[0],) or prediction["confidence"].shape != (z.shape[0],):
+            raise ValueError("source heading and confidence must have shape (B,)")
+        if angular_jitter is None:
+            if self.source_jitter == "zero":
+                angular_jitter = torch.zeros(z.shape[0], device=z.device, dtype=torch.float32)
+            else:
+                angular_jitter = torch.as_tensor(
+                    self._source_rng.vonmises(0., self.source_kappa, size=z.shape[0]),
+                    device=z.device, dtype=torch.float32,
+                )
+        else:
+            angular_jitter = torch.as_tensor(angular_jitter, device=z.device, dtype=torch.float32)
+            if angular_jitter.shape != (z.shape[0],):
+                raise ValueError("angular_jitter must have shape (B,)")
+            if not bool(torch.isfinite(angular_jitter).all()):
+                raise ValueError("angular_jitter must be finite")
+        # The source is a target distribution for this first experiment: gradients
+        # still reach the head through the condition and auxiliary loss, but not
+        # by moving the flow interpolation endpoints via a learned source angle.
+        theta = prediction["theta"].detach().to(device=z.device, dtype=torch.float32)
+        confidence = prediction["confidence"].detach().to(device=z.device)
+        raw = self.normalizer["action"].unnormalize(z.float())
+        resultant = raw[:, :self.heading_horizon, :2].sum(dim=1)
+        active = torch.isfinite(theta) & torch.isfinite(confidence)
+        active = active & (confidence >= self.min_source_confidence)
+        # Treat cancellation at affine-roundtrip precision as an undefined
+        # heading instead of amplifying tiny residuals with atan2.
+        roundoff = (8 * torch.finfo(raw.dtype).eps
+                    * raw[:, :self.heading_horizon, :2].abs().sum(dim=(1, 2)).clamp_min(1))
+        active = active & torch.isfinite(resultant).all(-1) & (resultant.norm(dim=-1) > roundoff)
+        # A safe inactive resultant avoids undefined atan2 gradients at zero.
+        safe_resultant = torch.where(
+            active[:, None], resultant,
+            torch.tensor([1., 0.], device=z.device, dtype=resultant.dtype),
+        )
+        theta_z = torch.atan2(safe_resultant[:, 1], safe_resultant[:, 0])
+        phi = torch.where(active, theta + angular_jitter - theta_z, torch.zeros_like(theta_z))
+        cosine, sine = phi.cos()[:, None], phi.sin()[:, None]
+        raw_columns = list(raw.unbind(-1))
+        for i, j in self.source_vector_blocks:
+            raw_columns[i] = cosine * raw[..., i] - sine * raw[..., j]
+            raw_columns[j] = sine * raw[..., i] + cosine * raw[..., j]
+        rotated = self.normalizer["action"].normalize(torch.stack(raw_columns, dim=-1)).to(z.dtype)
+        # Preserve all scalar channels and gated-off samples bit for bit, avoiding
+        # rounding from an otherwise algebraically identical affine roundtrip.
+        vector_indices = {i for block in self.source_vector_blocks for i in block}
+        out_columns = [rotated[..., i] if i in vector_indices else z[..., i]
+                       for i in range(self.action_dim)]
+        output = torch.stack(out_columns, dim=-1)
+        return torch.where(active[:, None, None], output, z), active
+
+    def transform_source(self, z, prediction, angular_jitter=None):
+        """Map an already scaled normalized source as N(R_phi(N^-1(z))).
+
+The rotation aligns the realized raw XY resultant to predicted heading plus
+angular jitter, and rotates the selected planar vector blocks together. Raw block norms
+are preserved; anisotropic Min-Max scaling need not preserve normalized norms.
+        """
+        return self._transform_source(z, prediction, angular_jitter)[0]
+
+    def predict_action(self, obs_dict, noise=None, angular_jitter=None, return_source=False):
+        """Euler inference with the same optional source map as flow training.
+
+``noise`` is an unscaled standard Gaussian draw. Source diagnostics are opt-in so
+ordinary IID inference retains the original output keys and random draw order.
+        """
+        cond, prediction = self.obs_encoder.encode_with_heading(obs_dict)
+        batch_size = cond.shape[0]
+        if noise is None:
+            noise = torch.randn(
+                batch_size, self.horizon, self.action_dim,
+                device=self.device, dtype=cond.dtype,
+            )
+        elif noise.shape != (batch_size, self.horizon, self.action_dim):
+            raise ValueError("noise must have shape (B, horizon, action_dim)")
+        source, active = self._transform_source(
+            self.prior_noise_scale * noise, prediction, angular_jitter,
+        )
+        x = source
+        dt = 1.0 / self.num_inference_steps
+        for i in range(self.num_inference_steps):
+            t = torch.full((batch_size,), i * dt, device=cond.device, dtype=cond.dtype)
+            x = x + dt * self.model(x, self._scale_t(t), cond)
+        action_pred = self.normalizer["action"].unnormalize(x)
+        result = {"action": action_pred[:, :self.n_action_steps], "action_pred": action_pred}
+        if return_source:
+            result.update(source=source, source_active=active, prediction=prediction)
+        return result
 
     @torch.no_grad()
     def set_heading_xy_rms(self, value):
@@ -181,11 +332,13 @@ it does not alter either actions or flow noise.
             "valid": confidence >= self.min_target_confidence,
         }
 
-    def loss_components(self, batch, noise=None, t=None):
+    def loss_components(self, batch, noise=None, t=None, angular_jitter=None):
         """One encoder forward; supplied IID noise/time enable paired comparisons.
 
 Baseline ``loss`` includes diagnostic-head supervision, whose features are
-detached. Use ``flow_loss`` for comparing action objectives between modes.
+detached. Compare ``flow_loss`` only between arms using the same source/path;
+a changed source changes the target velocity and loss scale. For different source
+laws, compare generated actions or closed-loop outcomes instead.
         """
         x1 = self.normalizer["action"].normalize(batch["action"])
         cond, prediction = self.obs_encoder.encode_with_heading(batch["obs"])
@@ -197,7 +350,9 @@ detached. Use ``flow_loss`` for comparing action objectives between modes.
             t = torch.rand(x1.shape[0], device=x1.device, dtype=x1.dtype)
         elif t.shape != (x1.shape[0],):
             raise ValueError("t must have shape (B,)")
-        x0 = self.prior_noise_scale * noise
+        x0, source_active = self._transform_source(
+            self.prior_noise_scale * noise, prediction, angular_jitter,
+        )
         t_b = t[:, None, None]
         xt = (1.0 - t_b) * x0 + t_b * x1
         velocity = self.model(xt, self._scale_t(t), cond)
@@ -218,6 +373,8 @@ detached. Use ``flow_loss`` for comparing action objectives between modes.
         return {
             "loss": flow_loss + weighted_heading_loss,
             "flow_loss": flow_loss,
+            "source": x0,
+            "source_active": source_active,
             "flow_mse_per_sample": flow_mse_per_sample,
             "heading_loss": heading_loss,
             "validity_loss": validity_loss,

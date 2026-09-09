@@ -237,3 +237,188 @@ def test_invalid_configuration_is_rejected():
     for value in (0, -1, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="heading_xy_rms"):
             policy.set_heading_xy_rms(value)
+
+
+def source_prediction(theta, confidence=None):
+    theta = torch.as_tensor(theta, dtype=torch.float32)
+    return {"theta": theta, "confidence": torch.ones_like(theta) if confidence is None
+            else torch.as_tensor(confidence, dtype=torch.float32)}
+
+
+def make_source_policy(mode="condition", blocks=((0, 1), (3, 4))):
+    policy = make_policy(mode)
+    policy.set_source_vector_blocks(blocks)
+    policy.set_source_mode("heading")
+    with torch.no_grad():
+        policy.obs_encoder.head[-1].bias[2] = 4
+    return policy
+
+
+@pytest.mark.parametrize("blocks", [((0, 1),), ((0, 1), (3, 4))])
+def test_heading_source_aligns_realized_raw_direction_and_preserves_geometry(blocks):
+    policy = make_source_policy(blocks=blocks)
+    with torch.no_grad():
+        policy.normalizer.params_dict["action"]["scale"].copy_(torch.tensor([1., 3., 2., 4., 5., 6., 7.]))
+        policy.normalizer.params_dict["action"]["offset"].copy_(torch.tensor([.2, -.3, .1, .4, -.2, .5, -.1]))
+    z = torch.randn(3, 4, 7)
+    prediction = source_prediction([0., .7, -1.3])
+    jitter = torch.tensor([.2, -.1, .3])
+    output = policy.transform_source(z, prediction, angular_jitter=jitter)
+    raw_before = policy.normalizer["action"].unnormalize(z)
+    raw_after = policy.normalizer["action"].unnormalize(output)
+    resultant = raw_after[..., :2].sum(1)
+    expected_angle = prediction["theta"] + jitter
+    expected_direction = torch.stack((expected_angle.cos(), expected_angle.sin()), -1)
+    torch.testing.assert_close(
+        resultant / resultant.norm(dim=-1, keepdim=True), expected_direction,
+        rtol=1e-5, atol=1e-6,
+    )
+    for block in blocks:
+        torch.testing.assert_close(
+            raw_before[..., list(block)].square().sum(-1),
+            raw_after[..., list(block)].square().sum(-1), rtol=1e-5, atol=1e-6,
+        )
+    untouched = [i for i in range(7) if i not in {d for b in blocks for d in b}]
+    torch.testing.assert_close(output[..., untouched], z[..., untouched], rtol=0, atol=0)
+    # A raw rotation conjugated by anisotropic Min-Max is not orthogonal in
+    # normalized coordinates. The experiment must not claim normalized norm preservation.
+    assert not torch.allclose(z.square().sum((1, 2)), output.square().sum((1, 2)))
+
+
+def test_source_confidence_gate_includes_threshold_and_ignores_invalid_heading():
+    policy = make_source_policy()
+    z = torch.randn(4, 4, 7)
+    prediction = source_prediction([1., 1., 1., float("nan")], [.8, .49, .5, 1.])
+    output, active = policy._transform_source(z, prediction, torch.zeros(4))
+    assert active.tolist() == [True, False, True, False]
+    torch.testing.assert_close(output[~active], z[~active], rtol=0, atol=0)
+    assert torch.isfinite(output).all()
+
+
+def test_source_gradient_detaches_reference_but_retains_finite_noise_gradients():
+    policy = make_source_policy()
+    z = torch.randn(3, 4, 7, requires_grad=True)
+    theta = torch.tensor([0., .7, -1.3], requires_grad=True)
+    confidence = torch.ones(3, requires_grad=True)
+    output = policy.transform_source(z, {"theta": theta, "confidence": confidence}, torch.zeros(3))
+    output.square().sum().backward()
+    assert theta.grad is None and confidence.grad is None
+    assert z.grad is not None and torch.isfinite(z.grad).all()
+    assert z.grad.abs().sum() > 0
+    assert all(p.grad is None for p in policy.normalizer.parameters())
+
+
+@pytest.mark.parametrize("mode", HEADING_MODES)
+def test_source_does_not_add_head_gradient_path_to_flow_loss(mode):
+    policy = make_source_policy(mode)
+    with torch.no_grad():
+        policy.model.cond_obs_emb.weight[:, -3:].normal_(0, .1)
+    result = policy.loss_components(batch(), angular_jitter=torch.zeros(3))
+    assert result["source_active"].all()
+    result["flow_loss"].backward()
+    assert gradients_nonzero(policy.obs_encoder.policy_encoder)
+    assert gradients_nonzero(policy.obs_encoder.head) == (mode == "condition")
+
+
+@pytest.mark.parametrize("blocks", [((0, 1),), ((0, 1), (3, 4))])
+def test_training_and_inference_use_identical_explicit_source(blocks):
+    policy = make_source_policy(blocks=blocks).eval()
+    data = batch()
+    noise, jitter, t = torch.randn_like(data["action"]), torch.tensor([.1, .3, -.2]), torch.rand(3)
+    training = policy.loss_components(data, noise=noise, t=t, angular_jitter=jitter)
+    inference = policy.predict_action(data["obs"], noise=noise, angular_jitter=jitter, return_source=True)
+    repeated = policy.predict_action(data["obs"], noise=noise, angular_jitter=jitter, return_source=True)
+    torch.testing.assert_close(training["source"], inference["source"], rtol=0, atol=0)
+    torch.testing.assert_close(training["source_active"], inference["source_active"], rtol=0, atol=0)
+    torch.testing.assert_close(inference["action_pred"], repeated["action_pred"], rtol=0, atol=0)
+    for key in training["prediction"]:
+        torch.testing.assert_close(training["prediction"][key], inference["prediction"][key], rtol=0, atol=0)
+
+
+def test_private_angular_rng_is_reproducible_and_does_not_advance_global_rngs():
+    import numpy as np
+
+    policy = make_source_policy()
+    z = torch.randn(3, 4, 7)
+    prediction = source_prediction([0., .7, -1.3])
+    torch_state = torch.random.get_rng_state().clone()
+    np_state = np.random.get_state()
+    policy.set_source_seed(17)
+    first = policy.transform_source(z, prediction)
+    second = policy.transform_source(z, prediction)
+    assert not torch.equal(first, second)
+    policy.set_source_seed(17)
+    repeated = policy.transform_source(z, prediction)
+    torch.testing.assert_close(first, repeated, rtol=0, atol=0)
+    torch.testing.assert_close(torch.random.get_rng_state(), torch_state, rtol=0, atol=0)
+    np_actual = np.random.get_state()
+    assert np_actual[0] == np_state[0] and np_actual[2:] == np_state[2:]
+    np.testing.assert_array_equal(np_actual[1], np_state[1])
+
+
+def test_heading_source_changes_angular_law_by_aligning_the_realized_chunk():
+    policy = make_source_policy(blocks=((0, 1),))
+    with torch.no_grad():
+        policy.normalizer.params_dict["action"]["scale"].fill_(1.)
+        policy.normalizer.params_dict["action"]["offset"].zero_()
+    policy.set_source_seed(712)
+    z = torch.randn(2048, 4, 7)
+    output = policy.transform_source(z, source_prediction(torch.zeros(2048)))
+    before = z[..., :2].sum(1)
+    after = output[..., :2].sum(1)
+    before_cosine = (before[:, 0] / before.norm(dim=-1)).mean()
+    after_cosine = (after[:, 0] / after.norm(dim=-1)).mean()
+    assert before_cosine.abs() < .1
+    assert after_cosine > .8  # kappa=4 concentration; independent Gaussian rotation would stay ~0.
+
+
+def test_iid_mode_ignores_extra_jitter_and_preserves_original_rng_and_keys():
+    policy = make_policy("condition").eval()
+    data = batch()
+    torch.manual_seed(118)
+    plain = policy.loss_components(data)
+    plain_rng = torch.random.get_rng_state().clone()
+    torch.manual_seed(118)
+    extra = policy.loss_components(data, angular_jitter=torch.ones(3))
+    torch.testing.assert_close(plain["flow_loss"], extra["flow_loss"], rtol=0, atol=0)
+    torch.testing.assert_close(plain["source"], extra["source"], rtol=0, atol=0)
+    torch.testing.assert_close(torch.random.get_rng_state(), plain_rng, rtol=0, atol=0)
+    assert not extra["source_active"].any()
+    assert set(policy.predict_action(data["obs"])) == {"action", "action_pred"}
+    # Sampling explicit angular noise for the heading arm cannot shift common
+    # PyTorch dropout, flow-time, or base-Gaussian draws in subsequent operations.
+    heading = copy.deepcopy(policy)
+    heading.set_source_mode("heading")
+    torch.manual_seed(119)
+    policy.loss_components(data)
+    expected_rng = torch.random.get_rng_state().clone()
+    torch.manual_seed(119)
+    heading.loss_components(data)
+    torch.testing.assert_close(torch.random.get_rng_state(), expected_rng, rtol=0, atol=0)
+
+
+def test_source_zero_raw_resultant_stays_finite_and_unchanged():
+    policy = make_source_policy()
+    raw = torch.zeros(3, 4, 7)
+    raw[:, 0, 0] = 1
+    raw[:, 1, 0] = -1
+    z = policy.normalizer["action"].normalize(raw).requires_grad_()
+    output, active = policy._transform_source(z, source_prediction([1., 2., 3.]), torch.zeros(3))
+    assert not active.any()
+    torch.testing.assert_close(output, z, rtol=0, atol=0)
+    output.sum().backward()
+    assert torch.isfinite(z.grad).all()
+
+
+def test_source_metadata_adds_no_checkpoint_tensors_and_validates_blocks():
+    policy = make_policy()
+    original_state = copy.deepcopy(policy.state_dict())
+    policy.set_source_mode("heading")
+    policy.set_source_vector_blocks(((0, 1),))
+    policy.load_state_dict(original_state, strict=True)
+    assert set(policy.state_dict()) == set(original_state)
+    for blocks in ((), ((0,),), ((0, 1), (1, 3)), ((0, 1), (3, 7)), ((3, 4),), ((0, 1.5),)):
+        with pytest.raises(ValueError, match="source_vector_blocks"):
+            policy.set_source_vector_blocks(blocks)
+    with pytest.raises(ValueError, match="source_mode"):
+        policy.set_source_mode("unknown")

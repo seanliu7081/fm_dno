@@ -23,9 +23,9 @@
 | 动作 | 每步 7 维；预测 16 步，通常执行前 8 步，再接收新观测 |
 | 生成器 | 默认 Transformer：embed_dim 256、4 层、4 heads；Euler 10 步 |
 | 主策略训练 | 默认 batch size 32、5001 epochs、EMA；默认值不代表已完成训练 |
-| 归一化 | 动作 `normalizer_mode=so2_block`，`normalizer_vector_mode=rms` |
+| 归一化 | 历史 D/E/F：动作 SO(2) block RMS；新增 shared-heading mini / 全量零扰动版本：训练集逐维 Min–Max |
 
-优化 seed 与数据划分 seed 是不同变量。多 seed 实验可以改变训练 seed，但保持参考训练的 `split_seed=42` 与策略的 `task.policy.dataset.seed=42`。方向参考和新增 shared-heading mini 实验的归一化统计只拟合训练 episodes。2026-09-09 代码核查发现：原通用 `ZarrDataset.get_normalizer()` 使用整个 replay buffer，因此历史主策略不能一概称为仅拟合训练统计；本次未修改该通用路径。
+优化 seed 与数据划分 seed 是不同变量。多 seed 实验可以改变训练 seed，但保持参考训练的 `split_seed=42` 与策略的 `task.policy.dataset.seed=42`。方向参考、新增 shared-heading mini 和全量零扰动版本的归一化统计只拟合训练 episodes。2026-09-09 代码核查发现：原通用 `ZarrDataset.get_normalizer()` 使用整个 replay buffer，因此历史主策略不能一概称为仅拟合训练统计；本次未修改该通用路径。
 
 ## 1. First：Heading predictor
 
@@ -378,12 +378,112 @@ DNO pilot 共导出 169 条实际控制周期记录；成功且被接受的记�
 
 完整证据：[协议与复现](shared_heading_mini.md)、[结果](../output/mini_shared_heading/mini_5000_20260909/results.md)、[配对 episode 统计](../output/mini_shared_heading/mini_5000_20260909/comparison.json)、[权重哈希](../output/mini_shared_heading/mini_5000_20260909/artifact_hashes.json)。17 项 CPU 测试、三分支 GPU smoke、真实观测的保存/恢复一致性检查通过。权重修复仅将版本元数据转为普通字符串，tensor 值未变。
 
+### 4.6 Shared heading condition + noise prior 的离线 mini test（2026-09-09）
+
+在 4.5 的共享、联合训练 heading condition 上增加两种方向 source。三组保持同一普通 Min–Max normalizer、数据划分、初始权重、批次及原始高斯噪声；每组 5,000 updates，seed 42/43。head 继续通过 condition 和辅助损失训练，**仅构造 source 时 detach 当前预测**，不测试通过 source 端点反传的方案。
+
+先验在原始坐标中计算并对齐这次噪声的平移 XY 合成方向，再归一化：`N(R_phi N^-1(z))`；`phi = predicted_heading + VonMises(0,4) - raw_noise_heading`，预测 validity 至少 0.5 才启用。`condition_prior_xy` 只旋转平移 XY；`condition_prior_both` 同时旋转旋转动作 XY。这份数据的平移 XY Min–Max 恰好相同缩放且零偏移，旋转 XY 则不是，因此双块先验还改变旋转噪声的均值/协方差，**不是原始 SO(2)-normalizer F 的精确复现**。
+
+| 分支 | 主评估动作 MSE | 主评估生成方向 MAE | 额外 4 组噪声动作 MSE | 额外 4 组噪声生成方向 MAE |
+| --- | ---: | ---: | ---: | ---: |
+| Condition + IID | 0.139015 | 50.78° | 0.140088 | 51.42° |
+| Condition + 平移 XY prior | 0.150203 | 49.00° | 0.141372 | 47.54° |
+| Condition + 双 XY 块 prior | 0.144900 | 49.16° | 0.140320 | 48.67° |
+
+所有值为两个训练 seed 均值，动作指标为相同 200 个验证窗口的前 8 步原始动作 MSE。主评估每个窗口一个固定 latent；额外 4 组独立、跨模型配对的 latent 只用于推理复核，不重训、不选最优采样，且保留原主结果。此补充在第一个 seed 显示“方向略好、动作更差”、第二个 seed 尚在训练时确定。
+
+主评估中 XY-only / 双块 prior 的平均动作 MSE 分别上升 8.05% / 4.23%。但额外噪声均值只高 0.92% / 0.17%，且两个训练 seed 的差值方向相反；配对 episode 区间都包含 0，故**不能宣称稳定退化**。额外噪声下生成方向误差分别下降 3.88° / 2.75°，两个 seed 都改善。
+
+当前证据是：方向 prior 确实有引导作用，但在已有共享 heading condition 后，**尚未显示整体动作质量的稳定额外收益**。下一步可保留联合训练的 head + condition，以 IID source 为默认对照。不同 source 的 flow 插值与速度标签不同，不能拿 native flow MSE 直接排名。此实验没有 rollout/SR，不能判断历史 39% vs 28% 差距或推广为所有 D/E/F 的必然结论。
+
+三组训练合计约 946.7 秒，补充推理约 6.5 秒（均不含数据准备）。31 项 CPU 测试通过；六个最终模型安全加载、配置恢复和真实观测重复采样检查通过。两个 IID 对照组逐步评估与各 487 个最终参数张量完整复现 4.5 的 condition 结果。
+
+证据：[协议与复现](heading_prior_mini.md)、[主结果](../output/mini_heading_prior/mini_5000_20260909/results.md)、[额外噪声验证](../output/mini_heading_prior/sampling_robustness_20260909/report.md)、[独立检查与权重哈希](../output/mini_heading_prior/mini_5000_20260909/verification.json)。代码：[训练 runner](../scripts/mini_heading_prior.py)、[额外采样 evaluator](../scripts/evaluate_mini_heading_prior_sampling.py)。
+
+### 4.7 固定模型的 prior 方向精度诊断（2026-09-09）
+
+为检验 heading 精度是否限制现有 XY prior，固定 4.6 的两个 `condition_prior_xy` EMA 模型、原预测 heading condition、Min–Max normalizer、validity gate、10 步 Euler，以及补充评估保存的 200 个验证窗口 × 4 组高斯噪声和 κ=4 角度扰动。仅将 source 使用的角度替换为 GT 或 GT 加 ±15°/±30°/±60°；误差正负号按窗口/噪声固定，跨角度级别和训练 seed 共享。GT 使用原始未来 16 步动作的 XY 合成方向，199/200 个标签有效，无效的 1 个窗口在所有组中精确保留原结果。没有重训。
+
+| Source 角度 | 前 8 步动作 MSE | XYZ MSE | 生成 16 步方向 MAE |
+| --- | ---: | ---: | ---: |
+| 原预测 | 0.141372 | 0.139278 | 47.54° |
+| GT | 0.137352 | 0.129041 | 31.14° |
+| GT ±15° | 0.138785 | 0.132548 | 34.03° |
+| GT ±30° | 0.143387 | 0.142675 | 42.09° |
+| GT ±60° | 0.159963 | 0.179812 | 66.53° |
+
+GT 替换使动作 MSE 降低 **2.84%**、XYZ MSE 降低 **7.35%**，两个 seed 均改善。平均动作差值为 −0.004019，按任务内 episode 配对 bootstrap 的 95% 区间为 [−0.006516, −0.001295]；此区间条件于两个固定模型和四组固定噪声，不表示跨训练 seed 的不确定性。两个模型的动作、XYZ 和生成方向误差都随注入误差 0/15/30/60° 单调上升。按原预测误差分组，>60° 窗口的改善最大，<15° 组基本持平；分组结果为描述性诊断。
+
+**此结果支持继续改进 source 的 heading 精度，但尚未证明改进后重训能超过 IID 或提高 SR。** GT 来自未来标签，只能用于诊断；模型训练时使用预测方向 source，而本次保留的 condition 仍可能预测错误。GT 组也保留 κ=4 随机扰动，因此初始噪声实际方向误差仍为 23.56°，并非精确对齐或严格性能上界。
+
+推理约 6.2 秒（不含数据准备）；原预测组的 source 和五项动作指标逐位复现上一轮补充评估。13 项新增诊断 CPU 测试与 31 项原策略测试全部通过。证据：[完整协议与复现](heading_prior_mini.md#fixed-model-source-angle-diagnostic-2026-09-09)、[报告](../output/mini_heading_prior/angle_sensitivity_20260909/report.md)、[敏感性曲线](../output/mini_heading_prior/angle_sensitivity_20260909/angle_sensitivity.png)、[分组图](../output/mini_heading_prior/angle_sensitivity_20260909/accuracy_strata.png)。代码：[evaluator](../scripts/evaluate_heading_angle_sensitivity.py)、[reporter](../scripts/summarize_heading_angle_sensitivity.py)。
+
+### 4.8 GT prior 的 condition × jitter 2×2 诊断（2026-09-09）
+
+为解释 4.7 的 GT prior 为何仍有约 31° 生成方向误差，固定同一模型、200 个验证窗口、4 组噪声和 GT source 中心角，交叉比较预测/GT heading condition 与原 κ=4 角度扰动/零扰动。GT condition 仅替换显式 cos/sin 两维，保留全部观测特征和预测 validity；原 source gate、normalizer 与采样器均不变。199 个有效标签参与干预，1 个无效窗口在四组中精确保留原预测 source、原扰动及原 condition。
+
+| Heading condition | Prior 角度扰动 | 前 8 步动作 MSE | XYZ MSE | 生成 16 步方向 MAE |
+| --- | --- | ---: | ---: | ---: |
+| 预测 | 原 κ=4 | 0.137352 | 0.129041 | 31.14° |
+| 预测 | 零扰动 | 0.131390 | 0.115072 | 15.60° |
+| GT | 原 κ=4 | 0.142568 | 0.128623 | 32.64° |
+| GT | 零扰动 | 0.136482 | 0.114723 | 15.94° |
+
+保持预测 condition 时，去掉扰动使动作 MSE 降低 **4.34%**、XYZ MSE 降低 **10.83%**，方向误差由 31.14° 降至 15.60°。两个 seed 都改善，GT condition 下去掉扰动也有改善。预测 condition 下动作差值为 −0.005962，条件于固定模型/噪声的配对 episode-bootstrap 95% 区间为 [−0.007285, −0.004527]。
+
+把显式 condition 换成 GT 没有改善平均整体动作误差；主要变化是夹爪误差增加，XYZ 基本不变。两个 seed 的动作差值均为正，但对应 episode 区间包含零，不能宣称普遍退化。整体动作的交互差值为 −0.000124，区间 [−0.001020, +0.000723]。这些区间不估计跨训练运行的不确定性。
+
+零扰动时初始 source 方向误差约为 0.000006°，但经过 flow 后仍为 15.60°/15.94°，说明精确对齐初始噪声不能强制最终方向正确；本次也未支持“把显式 condition 改 GT 就能消除剩余误差”的假设。不能将 source 与生成动作的 MAE 相减来分摊原因。所有组使用未来 GT 标签，GT condition 与零扰动都改变训练输入分布；**尚不能推断真实预测 prior 应直接取消扰动，也没有测 SR**。
+
+推理约 5.4 秒（不含准备），57 项 CPU 测试通过；原 GT source + 预测 condition + 原扰动组逐位复现 4.7。独立审计从原始 Zarr 重算全部 6,400 份生成动作指标并检查配对、condition 两维替换、source 几何与无效标签回退。证据：[协议与复现](heading_prior_mini.md#gt-source-condition--jitter-factorial-2026-09-09)、[报告](../output/mini_heading_prior/factorial_20260909/report.md)、[四组对比图](../output/mini_heading_prior/factorial_20260909/factorial_cells.png)、[独立审计](../output/mini_heading_prior/factorial_20260909/verification.json)。代码：[evaluator](../scripts/evaluate_heading_factorial.py)、[reporter](../scripts/summarize_heading_factorial.py)。
+
+### 4.9 零角度扰动的可训练入口（2026-09-09）
+
+新增 `scripts/mini_heading_prior.py --modes condition_prior_xy --source-jitter zero`：使用联合训练的预测 heading 同时作为 condition 与 XY prior 中心方向，训练、验证、默认推理和权重恢复均采用精确零角度扰动。仍保留高斯噪声、validity gate 和构造 source 时的 detach。GT 只用于监督，**不等同于 4.8 使用 GT prior 得到的 0.131390 / 15.60° 结果**。
+
+新 checkpoint 保存 `source_jitter`；旧 checkpoint 缺省恢复为 `vonmises`。显式传入角度扰动仍可覆盖默认值供诊断使用；`kappa=0` 表示均匀角度分布，不能当成零扰动。69 项 CPU 测试、CLI 和真实数据单步 GPU smoke 通过；该版本的正式 mini 已完成，结果见 4.10。默认命令仍为 4,000 固定训练窗口、两个 seed 各 5,000 updates 的 mini 协议；命令见 [训练说明](heading_prior_mini.md#training-with-predicted-heading-and-zero-angular-jitter)。
+
+### 4.10 预测 heading + 零扰动 prior 的正式 mini 结果（2026-09-09）
+
+按 4.9 命令从头训练两个 seed（42/43），各 5,000 updates；4,000 个训练窗口、1,000 个验证窗口、初始化、Min–Max normalizer 和其他训练参数保持与原实验一致。训练约 314.0 秒，随后用相同 200 个窗口 × 4 组已保存高斯噪声比较新模型与原 IID/κ=4 模型，推理约 6.6 秒。三组 condition 均来自预测，方向 prior 的中心角也均来自预测，未使用 GT 作为 source 输入。
+
+| Source | 前 8 步动作 MSE | XYZ MSE | 生成方向 MAE | 预测器 MAE |
+| --- | ---: | ---: | ---: | ---: |
+| IID | 0.140088 | 0.140357 | 51.42° | 34.85° |
+| 预测 XY prior，κ=4 | 0.141372 | 0.139278 | 47.54° | 35.15° |
+| 预测 XY prior，零扰动 | 0.137806 | 0.131320 | 44.81° | 34.98° |
+
+生成指标平均两个 seed 和四组噪声；预测器 MAE 使用原完整 1,000 个验证窗口中的有效标签。新模型平均动作 MSE 比 IID 低 1.63%、比 κ=4 低 2.52%，但**seed 42 对两个对照都变差，seed 43 对两个对照都改善**。零扰动的动作 MSE 分别为 0.143878/0.131734，IID 为 0.137924/0.142252，κ=4 为 0.142140/0.140604。XYZ 和生成方向误差在两个 seed 中均改善；预测器精度仍约 35°。
+
+零扰动减 IID 的配对动作差值为 −0.002282，固定模型/噪声条件下 episode-bootstrap 95% 区间为 [−0.006953, +0.002418]；减 κ=4 为 −0.003566，区间 [−0.006716, −0.000253]。这些区间不度量跨训练 seed 的不确定性，不能因后一项不跨零就声称 seed 间稳定。原单噪声主评估中，零扰动平均动作 MSE 为 0.140133，略高于 IID 的 0.139015，也保留在报告中。
+
+**当前支持零扰动对 XYZ 和生成方向的改善，但未建立整体动作质量对 IID 或 κ=4 的稳定优势，没有测 SR。** 4.8 的 0.131390 / 15.60° 仍是旧模型使用 GT prior 的离线参照，不能归为新模型成绩。
+
+新旧 split、normalizer 和初始预测逐项核对一致；当前代码下四个旧模型的 source 与动作指标逐位复现，κ=4 模型的完整生成动作也逐位复现。训练前已通过 69 项 CPU 测试。证据：[完整协议与复现](heading_prior_mini.md#completed-predicted-heading-zero-jitter-mini-2026-09-09)、[汇总报告](../output/mini_heading_prior/zero_jitter_comparison_20260909/report.md)、[对比图](../output/mini_heading_prior/zero_jitter_comparison_20260909/comparison.png)、[训练产物](../output/mini_heading_prior/predicted_zero_5000_seed42_43/summary.json)。代码：[跨训练 evaluator](../scripts/compare_zero_jitter_training.py)。
+
+### 4.11 预测 heading + 零扰动 prior 的全量训练入口（2026-09-09）
+
+新增独立 [policy](../oat/policy/flow_policy_heading_zero.py) 与 [配置](../oat/config/train_flowpolicy_heading_zero.yaml)，将 4.10 的 `condition_prior_xy + source_jitter=zero` 接入正式 `TrainPolicyWorkspace`。共享 encoder/head 联合训练，预测方向同时用于 condition 和 XY prior；GT 仅作监督。保留 Min–Max、训练集 RMS、独立 head LR `1e-3`、core/head 分别裁剪及 100 步 warmup。新 [dataset](../oat/dataset/heading_zarr_dataset.py) 只用训练 episodes 拟合统计；workspace 的可选 hook 支持 RMS 初始化和分组裁剪，旧 policy 路径保持原行为。
+
+默认固定 split seed 42，450/50 episodes；候选窗口从 mini 的 4,000/1,000 扩展到 124,342/13,748，使用正式 DataLoader。batch 32、5001 epochs 是完整训练预算，**不是 5000 updates**；默认 `drop_last=true` 的尾 batch 行为和 scheduler 首步差异见说明。checkpoint 保存完整配置、normalizer 和 RMS，标准 `BasePolicy.from_checkpoint` 可恢复，无需 heading reference 或推理时访问 dataset。
+
+此配置默认 `task.policy.lazy_eval=false`、`training.rollout_every=50`，开启每 50 epochs 的闭环 SR 评估；默认已改为 `task.policy.env_runner.n_parallel_envs=10`，每次仍评估 500 回合。workspace 从 0 开始编号，实际在 epoch 0、50、100…训练结束后 rollout；验证 loss、动作重建和 checkpoint 保存仍每 10 epochs 执行，即 epoch 0、10、20…。top-k 仍按完整 16 步 raw reconstruction MSE 选取，该指标与 mini 的前 8 步 MSE 不是同一协议。GPU 1 的启动命令已包含 `MUJOCO_GL=egl PYOPENGL_PLATFORM=egl MUJOCO_EGL_DEVICE_ID=1`。
+
+相关 110 项测试通过；真实全量数据的正式 workspace 已完成 3 个训练 batch、验证、动作重建与 checkpoint 保存/加载检查。该历史 smoke 使用 `task.policy.lazy_eval=true`，没有运行模拟器 rollout。**该历史 smoke 没有运行完整训练或 SR 评估。** 命令与说明：[heading_zero_full.md](heading_zero_full.md)；证据：[验证记录](../output/heading_zero/full_training_validation_20260909/verification.json)。
+
+后续实际启动在首次 rollout 创建 20 个 Libero worker 时出现 `Killed`。Gym 停止维护提示仅来自导入，不能据此认定退出原因。排查时当前会话 cgroup 累计记录 4 次历史 OOM kill，历史内存峰值约 52.8 GiB；因无法访问带时间戳的内核记录，现有证据支持 RAM 压力，但尚不能把累计事件与该进程逐项对应。模拟器闭包未捕获训练 dataset/model。默认并行数降至 10 后，有界真实重试已通过：完整 RGB 数据集、3 个训练 batch、20 个截短回合（每任务 2 个、每回合 8 个动作）、2 个视频、验证/重建/checkpoint 均完成，exit 0，耗时 38.05 秒。监测期间主机可用 RAM 最低 19.441 GiB，会话 cgroup 占用峰值 41.410 GiB（含缓存），OOM kill 计数保持 4→4；相关配置与 worker 测试 14 项通过。证据：[guard_result.json](../output/heading_zero/eval_memory_debug_20260909_retry1/guard_result.json)、[workspace.log](../output/heading_zero/eval_memory_debug_20260909_retry1/workspace.log)。这不等于完整训练或默认 500 回合、最长 550 步的 SR 评估。
+
+20→10 保留名义任务/seed 排列表，但已有 runner 对同任务重复回合未重新应用记录 seed，且 `LiberoEnv.reset` 忽略传入 seed，因此不能保证不同并行数的真实初始状态精确配对。本次仅调整该配置的并行数，未修改 seed 行为。
+
+首次受监控验证由用户手动停止（SIGTERM/exit 143，无新增 OOM），见 [中断记录](../output/heading_zero/eval_memory_debug_20260909/interruption.json)。失败的 `output/heading_zero/seed42_full` 在首次 rollout 前尚未保存 checkpoint；文档中的重新启动命令改用 `output/heading_zero/seed42_full_env10` 和 `training.resume=false`，保留旧日志。本次排查没有进一步启动完整训练。
+
 ## 5. 当前 artifact 与代码入口
 
 所有 `output/` 目录都是本地实验产物，通常不纳入 Git。要跨机器恢复上下文，必须同步对应数据与 checkpoint，不能只复制本文。
 
 | 入口 | 用途 / 状态 |
 | --- | --- |
+| [heading_zero_full.md](heading_zero_full.md) | 共享 heading condition + 预测 XY prior 零扰动的独立 policy、完整训练配置与命令 |
 | [heading_predictor.py](../oat/perception/heading_predictor.py) | 参考网络、监督、冻结与 artifact 格式 |
 | [train_heading_reference.py](../scripts/train_heading_reference.py) | 离线参考训练 |
 | [flow_policy_learned_canon.py](../oat/policy/flow_policy_learned_canon.py) | D/E/F 的参考 condition/source 接入 |

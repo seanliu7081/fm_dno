@@ -8,6 +8,7 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
+from collections.abc import Mapping
 import hydra
 from datetime import timedelta
 import torch
@@ -34,6 +35,50 @@ from oat.model.common.misc import detect_bf16_support
 from oat.policy.base_policy import BasePolicy
 
 register_new_resolvers()
+
+
+def _configure_models_from_dataset(dataset, *models):
+    """Optional train-dataset initialization; resumed buffers are loaded later."""
+    for model in models:
+        configure = getattr(model, "configure_from_dataset", None)
+        if callable(configure):
+            configure(dataset)
+
+
+def _clip_grad_norm(accelerator, model, optimizer, max_norm):
+    """Honor optional independent clipping groups without repeated AMP unscale."""
+    if max_norm is None:
+        return None
+    policy = accelerator.unwrap_model(model)
+    get_groups = getattr(policy, "get_gradient_clip_groups", None)
+    if not callable(get_groups):
+        return accelerator.clip_grad_norm_(model.parameters(), max_norm)
+
+    groups = get_groups()
+    if not isinstance(groups, Mapping):
+        raise ValueError("Gradient clip groups must be a mapping of names to parameters")
+    groups = {name: list(parameters) for name, parameters in groups.items()}
+    expected = {id(parameter) for parameter in policy.parameters() if parameter.requires_grad}
+    seen = set()
+    for name, parameters in groups.items():
+        for parameter in parameters:
+            identity = id(parameter)
+            if identity in seen:
+                raise ValueError(f"Gradient clip parameter appears more than once: {name}")
+            if identity not in expected:
+                raise ValueError(f"Gradient clip group contains a non-trainable or foreign parameter: {name}")
+            seen.add(identity)
+    if seen != expected:
+        raise ValueError("Gradient clip groups must cover every trainable model parameter")
+
+    # Accelerator.clip_grad_norm_ unscales internally. Calling it for each group
+    # would unscale the same FP16 optimizer twice, so unscale once before clipping.
+    accelerator.unscale_gradients(optimizer)
+    return {
+        name: torch.nn.utils.clip_grad_norm_(
+            parameters, max_norm, error_if_nonfinite=True)
+        for name, parameters in groups.items()
+    }
 
 
 class TrainPolicyWorkspace(BaseWorkspace):
@@ -102,6 +147,7 @@ class TrainPolicyWorkspace(BaseWorkspace):
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
+        _configure_models_from_dataset(dataset, self.model, self.ema_model)
 
         # configure checkpoint
         if accelerator.is_main_process:
@@ -220,8 +266,8 @@ class TrainPolicyWorkspace(BaseWorkspace):
                             if accelerator.sync_gradients:
                                 # clip grad norm
                                 if cfg.training.max_grad_norm is not None:
-                                    accelerator.clip_grad_norm_(
-                                        self.model.parameters(), 
+                                    _clip_grad_norm(
+                                        accelerator, self.model, self.optimizer,
                                         cfg.training.max_grad_norm
                                     )
                             
