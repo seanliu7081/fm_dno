@@ -25,7 +25,7 @@
 | 主策略训练 | 默认 batch size 32、5001 epochs、EMA；默认值不代表已完成训练 |
 | 归一化 | 动作 `normalizer_mode=so2_block`，`normalizer_vector_mode=rms` |
 
-优化 seed 与数据划分 seed 是不同变量。多 seed 实验可以改变训练 seed，但保持参考训练的 `split_seed=42` 与策略的 `task.policy.dataset.seed=42`。归一化统计只拟合训练 episodes。
+优化 seed 与数据划分 seed 是不同变量。多 seed 实验可以改变训练 seed，但保持参考训练的 `split_seed=42` 与策略的 `task.policy.dataset.seed=42`。方向参考和新增 shared-heading mini 实验的归一化统计只拟合训练 episodes。2026-09-09 代码核查发现：原通用 `ZarrDataset.get_normalizer()` 使用整个 replay buffer，因此历史主策略不能一概称为仅拟合训练统计；本次未修改该通用路径。
 
 ## 1. First：Heading predictor
 
@@ -357,6 +357,26 @@ DNO pilot 共导出 169 条实际控制周期记录；成功且被接受的记�
 产物：[initializer best.pt](../output/task_dno/e_ep0200_initializer_pilot_seed1000/best.pt)、[run.json](../output/task_dno/e_ep0200_initializer_pilot_seed1000/run.json)、[summary.json](../output/task_dno/e_ep0200_initializer_pilot_seed1000/summary.json)。它只绑定上述 E epoch-200 基础 checkpoint。
 
 新 seed 2000/2001 上已执行 baseline、amortized、amortized_dno，每回合仅 16 步，初态匹配且学习噪声修正非零：[smoke results](../output/task_dno/e_ep0200_initializer_smoke_seed2000/results.json)。这些回合均未成功，短长度只验证加载和执行路径，不能评价成功率收益。8.35% 是 teacher 拟合改善，也不能等同于任务收益。
+
+### 4.5 Shared ObsEncoder + heading 的离线 mini test（2026-09-09）
+
+为检验“同一观测是否已经足以从主策略特征中读出方向，以及显式 heading 是否仍有优化价值”，新增 [SharedHeadingFlowPolicy](../oat/policy/flow_policy_shared_heading.py) 和 [mini runner](../scripts/mini_shared_heading.py)。这三个分支是新的共享编码器实验，**不沿用原冻结 E/D/F 的模型身份**。
+
+共同协议：原 450/50 episode 划分、split seed 42；10 个任务均衡采样 4,000 个训练窗口和 1,000 个验证窗口；训练 seed 42/43；每分支从零训练 5,000 updates，batch 32；相同骨干、初始权重、批次、增强、flow noise/time；普通 Min–Max 动作归一化，统计仅来自训练 episodes；IID source；EMA、10 步 Euler。方向标签保持原始 XY 的 16 步合成方向，采样动作误差使用前 8 步。两个辅助损失权重均为 0.1。
+
+| 分支 | 方向读出 MAE | Flow 验证 MSE | 前 8 步原始动作 MSE | 生成动作块方向 MAE |
+| --- | ---: | ---: | ---: | ---: |
+| Basic Flow + detached 诊断读出头 | 39.93° | 0.181017 | 0.151808 | 69.43° |
+| 共享 encoder + 方向辅助监督 | 33.56° | 0.181084 | 0.159220 | 65.52° |
+| 共享 encoder + 辅助监督 + heading condition | 34.85° | 0.174208 | 0.139015 | 50.78° |
+
+表中为两个 seed 均值；方向指标使用有效标签，生成动作指标使用均衡覆盖验证 episodes 的 200 个窗口。Basic Flow 的读出头只接收 detached 特征，且与策略分开裁剪梯度，不改变策略更新。仅由训练窗口拟合的全局/任务平均方向参照误差分别为 82.93°/78.19°。
+
+结果支持普通共享特征可读出方向；但特征包含机器人状态，不能单独证明视觉几何学习。辅助监督使方向更准，却没有改善整体动作目标。新增 condition 相比 baseline 的 flow MSE 平均下降 3.76%，生成动作方向误差下降 26.86%，两个 seed 均改善；原始动作 MSE 平均下降 8.43%，但分别是 **16.28% 和 0.04%**，对训练 seed 的稳定性尚未建立。
+
+**没有进行环境 rollout，也没有测 SR。不能将这些离线误差转换为成功率，更不能宣称恢复了用户所述 39% baseline。** 原 baseline 39% 的精确 checkpoint 尚未定位。本次固定预算约 928.4 秒（不含数据准备/开发）；600-update pilot 仅用于吞吐和早期学习检查，正式结论使用预设 5,000-update 终点。
+
+完整证据：[协议与复现](shared_heading_mini.md)、[结果](../output/mini_shared_heading/mini_5000_20260909/results.md)、[配对 episode 统计](../output/mini_shared_heading/mini_5000_20260909/comparison.json)、[权重哈希](../output/mini_shared_heading/mini_5000_20260909/artifact_hashes.json)。17 项 CPU 测试、三分支 GPU smoke、真实观测的保存/恢复一致性检查通过。权重修复仅将版本元数据转为普通字符串，tensor 值未变。
 
 ## 5. 当前 artifact 与代码入口
 
