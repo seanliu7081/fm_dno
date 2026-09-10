@@ -8,6 +8,9 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
+import random
+import warnings
+import numpy as np
 from collections.abc import Mapping
 import hydra
 from datetime import timedelta
@@ -43,6 +46,26 @@ def _configure_models_from_dataset(dataset, *models):
         configure = getattr(model, "configure_from_dataset", None)
         if callable(configure):
             configure(dataset)
+
+
+
+def _epoch_events(epoch, training, *, lazy_eval, save_rollout_checkpoint=False,
+                  save_final_checkpoint=False):
+    """Keep legacy cadence by default; optionally count completed rollout epochs."""
+    offset = training.get('rollout_epoch_offset', 0)
+    if offset not in (0, 1):
+        raise ValueError("rollout_epoch_offset must be 0 or 1")
+    rollout_every = int(training.rollout_every)
+    checkpoint_every = int(training.checkpoint_every)
+    if rollout_every < 1 or checkpoint_every < 1:
+        raise ValueError("Rollout and checkpoint intervals must be positive")
+    rollout_due = not lazy_eval and (epoch + offset) % rollout_every == 0
+    checkpoint_due = (
+        epoch % checkpoint_every == 0
+        or (save_rollout_checkpoint and rollout_due)
+        or (save_final_checkpoint and epoch + 1 == training.num_epochs)
+    )
+    return rollout_due, checkpoint_due
 
 
 def _clip_grad_norm(accelerator, model, optimizer, max_norm):
@@ -82,7 +105,13 @@ def _clip_grad_norm(accelerator, model, optimizer, max_norm):
 
 
 class TrainPolicyWorkspace(BaseWorkspace):
-    include_keys = ['global_step', 'epoch']
+    # Plain metadata works with BaseWorkspace and inference-only restoration,
+    # which intentionally does not instantiate an EMA controller or scheduler.
+    include_keys = [
+        'global_step', 'epoch', 'resume_state_version', 'next_epoch',
+        'next_global_step', 'optimizer_step', 'ema_state',
+        'lr_scheduler_state', 'lr_scheduler_config', 'rng_state',
+    ]
 
     def __init__(self, cfg: OmegaConf, output_dir=None, lazy_instantiation=True):
         super().__init__(cfg, output_dir=output_dir)
@@ -103,11 +132,125 @@ class TrainPolicyWorkspace(BaseWorkspace):
             self.optimizer = None
         else:
             self.model = hydra.utils.instantiate(cfg.policy)
+            self.ema_model = None
             if cfg.training.use_ema:
                 self.ema_model = copy.deepcopy(self.model)
             self.optimizer = self.model.get_optimizer(**cfg.optimizer)
         self.global_step = 0
         self.epoch = 0
+        self.resume_state_version = 1
+        self.next_epoch = None
+        self.next_global_step = None
+        self.optimizer_step = 0
+        self.ema_state = None
+        self.lr_scheduler_state = None
+        self.lr_scheduler_config = None
+        self.rng_state = None
+
+    def _resume_training_progress(self, payload, *, legacy_epoch_complete=False):
+        """Advance completed training snapshots without changing logged epoch IDs.
+
+        Only run() opts into the legacy convention: its latest.ckpt was written
+        after an epoch finished. Loading a policy or an arbitrary checkpoint does
+        not itself advance training progress.
+        """
+        modern = 'resume_state_version' in payload.get('pickles', {})
+        if modern:
+            if self.next_epoch is not None:
+                self.epoch = int(self.next_epoch)
+                self.global_step = int(self.next_global_step)
+            return
+        saved_cfg = payload.get('cfg', {})
+        known_workspace = saved_cfg.get('_target_') == 'oat.workspace.train_policy.TrainPolicyWorkspace'
+        legacy_complete = (legacy_epoch_complete and known_workspace
+                           and 'optimizer' in payload.get('state_dicts', {})
+                           and {'epoch', 'global_step'} <= payload.get('pickles', {}).keys())
+        # Adam's parameter step counters survive legacy checkpointing and are
+        # more accurate than the logging counter with gradient accumulation.
+        counts = [int(state['step']) for state in self.optimizer.state.values() if 'step' in state]
+        accumulation = int(self.cfg.training.get('gradient_accumulate_every', 1))
+        self.optimizer_step = max(counts) if counts else max(
+            0, (self.global_step + int(legacy_complete) + accumulation - 1) // accumulation)
+        if legacy_complete:
+            self.epoch += 1
+            self.global_step += 1
+        warnings.warn(
+            'Legacy training checkpoint has no EMA/scheduler/RNG resume metadata; '
+            f'reconstructing optimizer updates as {self.optimizer_step}. '
+            'Random-number streams cannot be recovered.', RuntimeWarning)
+
+    def _create_training_dynamics(self, cfg, len_train_dataloader, ema_model=None):
+        """Restore EMA and LR schedules after accelerator wraps the optimizer.
+
+        Saved schedule configuration takes precedence over a changed epoch
+        budget so extending a run does not silently change its existing curve.
+        """
+        ema = None
+        if ema_model is not None:
+            ema = hydra.utils.instantiate(cfg.ema, model=ema_model)
+            if self.ema_state is not None:
+                ema.load_state_dict(self.ema_state)
+            else:
+                # Legacy checkpoints retain the averaged weights but not their
+                # warmup count. Never reset a resumed EMA to decay zero.
+                ema.optimization_step = self.optimizer_step
+                ema.decay = ema.get_decay(max(self.optimizer_step - 1, 0))
+        if self.lr_scheduler_config is None:
+            self.lr_scheduler_config = {
+                'name': cfg.training.lr_scheduler,
+                'num_warmup_steps': cfg.training.lr_warmup_steps,
+                'num_training_steps': (len_train_dataloader * cfg.training.num_epochs)
+                                     // cfg.training.gradient_accumulate_every,
+            }
+        # Scheduler construction performs an initial step and changes group LRs.
+        # A restored optimizer's LRs must survive that side effect.
+        loaded_lrs = [group['lr'] for group in self.optimizer.param_groups]
+        scheduler = get_scheduler(
+            optimizer=self.optimizer, **self.lr_scheduler_config,
+            last_epoch=-1 if self.lr_scheduler_state is not None else self.optimizer_step - 1,
+        )
+        if self.lr_scheduler_state is not None:
+            scheduler.load_state_dict(self.lr_scheduler_state)
+            for group, lr in zip(self.optimizer.param_groups, loaded_lrs):
+                group['lr'] = lr
+        return ema, scheduler
+
+    def _capture_training_state(self, ema, scheduler, accelerator):
+        """Capture a completed epoch, including each rank's main-process RNG.
+
+        Persistent DataLoader workers and sampler generators are not serialized.
+        Consequently resumed loader shuffling/worker-side augmentation can differ;
+        exact numerical continuation requires the same batches and worker states.
+        """
+        self.next_epoch = self.epoch + 1
+        self.next_global_step = self.global_step + 1
+        self.ema_state = None if ema is None else copy.deepcopy(ema.state_dict())
+        self.lr_scheduler_state = copy.deepcopy(scheduler.state_dict())
+        state = {
+            'python': random.getstate(), 'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+        }
+        if accelerator.device.type == 'cuda':
+            state['cuda'] = torch.cuda.get_rng_state(accelerator.device)
+        if accelerator.num_processes > 1:
+            states = [None] * accelerator.num_processes
+            torch.distributed.all_gather_object(states, state)
+            self.rng_state = states
+        else:
+            self.rng_state = [state]
+
+    def _restore_training_rng(self, accelerator):
+        if self.rng_state is None:
+            return
+        if len(self.rng_state) != accelerator.num_processes:
+            warnings.warn('Process count changed; checkpoint RNG streams cannot be restored.', RuntimeWarning)
+            return
+        state = self.rng_state[accelerator.process_index]
+        random.setstate(state['python'])
+        np.random.set_state(state['numpy'])
+        torch.set_rng_state(state['torch'].cpu())
+        if accelerator.device.type == 'cuda' and 'cuda' in state:
+            torch.cuda.set_rng_state(state['cuda'].cpu(), accelerator.device)
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
@@ -169,7 +312,8 @@ class TrainPolicyWorkspace(BaseWorkspace):
             latest_ckpt_path = self.get_checkpoint_path()
             if latest_ckpt_path.is_file():
                 accelerator.print(f"Resuming from checkpoint {latest_ckpt_path}")
-                self.load_checkpoint(path=latest_ckpt_path)
+                payload = self.load_checkpoint(path=latest_ckpt_path)
+                self._resume_training_progress(payload, legacy_epoch_complete=True)
                 if self.epoch >= cfg.training.num_epochs:
                     accelerator.print(f"Already trained for {self.epoch} epochs. Exiting.")
                     return
@@ -194,20 +338,10 @@ class TrainPolicyWorkspace(BaseWorkspace):
         )
         if cfg.training.use_ema:
             self.ema_model = accelerator.prepare(self.ema_model)
-            ema = hydra.utils.instantiate(cfg.ema, model=accelerator.unwrap_model(self.ema_model))
-
-        # configure lr scheduler
         len_train_dataloader = len(train_dataloader)
-        lr_scheduler = get_scheduler(
-            cfg.training.lr_scheduler,
-            optimizer=self.optimizer,
-            num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(
-                len_train_dataloader * cfg.training.num_epochs) \
-                    // cfg.training.gradient_accumulate_every,
-            # pytorch assumes stepping LRScheduler every epoch
-            # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step-1
+        ema, lr_scheduler = self._create_training_dynamics(
+            cfg, len_train_dataloader,
+            accelerator.unwrap_model(self.ema_model) if cfg.training.use_ema else None,
         )
 
         # configure logging
@@ -223,6 +357,10 @@ class TrainPolicyWorkspace(BaseWorkspace):
             accelerator.get_tracker("wandb").run.config.update({
                 "output_dir": str(self.output_dir)
             })
+
+        # Restore after construction, device preparation, and tracker setup,
+        # which can consume RNG draws unrelated to the continuation.
+        self._restore_training_rng(accelerator)
 
         # training loop
         with JsonLogger(os.path.join(self.output_dir, 'logs.json')) as json_logger:
@@ -273,11 +411,11 @@ class TrainPolicyWorkspace(BaseWorkspace):
                             
                                 self.optimizer.step()
                                 self.optimizer.zero_grad(set_to_none=True)
-                                lr_scheduler.step()
-
-                                # update ema
-                                if cfg.training.use_ema:
-                                    ema.step(accelerator.unwrap_model(self.model))
+                                if not getattr(self.optimizer, 'step_was_skipped', False):
+                                    self.optimizer_step += 1
+                                    lr_scheduler.step()
+                                    if cfg.training.use_ema:
+                                        ema.step(accelerator.unwrap_model(self.model))
 
                             # logging
                             is_last_batch = (batch_idx == (len_train_dataloader-1))
@@ -317,11 +455,22 @@ class TrainPolicyWorkspace(BaseWorkspace):
                     policy = accelerator.unwrap_model(self.ema_model)
                 policy.eval()
 
-                # run policy rollout
+                rollout_due, checkpoint_due = _epoch_events(
+                    self.epoch, cfg.training, lazy_eval=lazy_eval,
+                    save_rollout_checkpoint=cfg.checkpoint.get('save_rollout_ckpt', False),
+                    save_final_checkpoint=cfg.checkpoint.get('save_final_ckpt', False),
+                )
+                # A checkpoint-aware runner isolates simulator RNG and returns
+                # metrics to this training run after a fixed-policy evaluation.
                 if not lazy_eval:
                     accelerator.wait_for_everyone()
-                    if accelerator.is_main_process and (self.epoch % cfg.training.rollout_every) == 0:
-                        runner_log = env_runner.run(policy)
+                    if accelerator.is_main_process and rollout_due:
+                        run_checkpoint = getattr(env_runner, 'run_checkpoint', None)
+                        if callable(run_checkpoint):
+                            runner_log = run_checkpoint(
+                                policy, cfg, epoch=self.epoch, global_step=self.global_step)
+                        else:
+                            runner_log = env_runner.run(policy)
                         step_log.update(runner_log)
                     accelerator.wait_for_everyone()
 
@@ -401,8 +550,12 @@ class TrainPolicyWorkspace(BaseWorkspace):
                     if accelerator.is_main_process:
                         step_log['test_reconst_mse'] = (loss_info[0] / loss_info[1]).item()
 
+                # Every rank contributes its RNG state before the main rank saves.
+                if checkpoint_due:
+                    self._capture_training_state(ema, lr_scheduler, accelerator)
+
                 # checkpoint
-                if accelerator.is_main_process and (self.epoch % cfg.training.checkpoint_every) == 0:
+                if accelerator.is_main_process and checkpoint_due:
                     # unwrap
                     model_ddp = self.model
                     self.model = accelerator.unwrap_model(self.model)
@@ -415,6 +568,11 @@ class TrainPolicyWorkspace(BaseWorkspace):
                         self.save_checkpoint()
                     if cfg.checkpoint.save_last_snapshot:
                         self.save_snapshot()
+                    if rollout_due and cfg.checkpoint.get('save_rollout_ckpt', False):
+                        archive = pathlib.Path(self.output_dir) / 'checkpoints' / f'epoch-{self.epoch + 1:04d}.ckpt'
+                        if archive.exists():
+                            raise FileExistsError(f"Refusing to overwrite rollout checkpoint: {archive}")
+                        self.save_checkpoint(path=archive, use_thread=False)
 
                     # sanitize metric names
                     metric_dict = dict()
@@ -443,6 +601,10 @@ class TrainPolicyWorkspace(BaseWorkspace):
                 # increment epoch and global step
                 self.epoch += 1
                 self.global_step += 1
+
+        # Ensure the final asynchronous latest checkpoint is complete on exit.
+        if accelerator.is_main_process and self._saving_thread is not None:
+            self._saving_thread.join()
 
         # clean up
         if not lazy_eval:

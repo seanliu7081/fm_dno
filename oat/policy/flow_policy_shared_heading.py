@@ -156,10 +156,28 @@ checkpoints still load strictly.
         )
         if self.action_dim < 2:
             raise ValueError("XY heading requires at least two action dimensions")
-        if not isinstance(getattr(self.model, "cond_obs_emb", None), nn.Linear):
-            raise ValueError("SharedHeadingFlowPolicy currently requires the transformer backbone")
-        with torch.no_grad():
-            self.model.cond_obs_emb.weight[:, -3:].zero_()
+        zero_columns = getattr(self.model, "zero_condition_columns", None)
+        if callable(zero_columns):
+            zero_columns(range(self.obs_feature_dim - 3, self.obs_feature_dim))
+        elif isinstance(getattr(self.model, "cond_obs_emb", None), nn.Linear):
+            # Preserve existing transformer initialization and checkpoint keys.
+            with torch.no_grad():
+                self.model.cond_obs_emb.weight[:, -3:].zero_()
+        elif self.backbone_type == "starvla_dit":
+            # StarVLA feeds raw observation features to cross-attention K/V
+            # projections rather than using a shared observation embedding.
+            with torch.no_grad():
+                for block in self.model.blocks:
+                    if not block.cross_attention:
+                        continue
+                    attention = block.attention
+                    if attention.in_proj_weight is not None:
+                        attention.in_proj_weight[attention.embed_dim:, -3:].zero_()
+                    else:
+                        attention.k_proj_weight[:, -3:].zero_()
+                        attention.v_proj_weight[:, -3:].zero_()
+        else:
+            raise ValueError("Heading flow backbone must support observation condition initialization")
         self.heading_horizon = heading_horizon
         self.min_target_confidence = float(min_target_confidence)
         self.heading_loss_weight = float(heading_loss_weight)

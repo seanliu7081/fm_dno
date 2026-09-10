@@ -1,6 +1,6 @@
 # Past2Next
 
-Current heading / flow / DNO research: [长期项目上下文与实验记录](docs/project_context.md).
+Current heading-flow design: [Heading Zero and Heading Gaussian](docs/heading_policies.md).
 
 Two-stage discrete action modelling for robot manipulation, benchmarked on **LIBERO-10**.
 
@@ -326,10 +326,10 @@ HYDRA_FULL_ERROR=1 MUJOCO_GL=egl accelerate launch \
     training.num_epochs=5001 training.num_demo=500 task.policy.lazy_eval=false
 ```
 
-The optional **mixed adaLN-Zero** and **StarVLA / GR00T-style** action backbones
-each have plain-flow and learned-heading-conditioned configs. See
-[flow backbone variants](docs/flow_backbones.md) for the four configs, architecture
-differences, reference-checkpoint setup, and training commands.
+Heading Zero and Heading Gaussian each support Transformer, U-Net and StarVLA-DiT.
+See [the current heading design](docs/heading_policies.md) for the six standalone
+configs, heading prediction, conditioning, source distributions and training settings,
+and [the backbone guide](docs/flow_backbones.md) for architecture details.
 
 **`train_flowpolicy_with_enriched_past`** — the same flow policy with Past2Next's enriched-past
 conditioning, isolating that idea from the discrete bottleneck. Uses `libero10_with_past`.

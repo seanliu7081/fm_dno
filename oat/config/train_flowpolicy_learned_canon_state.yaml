@@ -1,6 +1,0 @@
-# C: learned state-only reference; the main policy still sees images and states.
-defaults:
-  - train_flowpolicy_learned_canon
-  - _self_
-name: train_flowpolicy_learned_canon_state
-reference_mode: state

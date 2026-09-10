@@ -1,4 +1,5 @@
 import copy
+import math
 import torch
 from torch.nn.modules.batchnorm import _BatchNorm
 
@@ -40,6 +41,33 @@ class EMAModel:
 
         self.decay = 0.0
         self.optimization_step = 0
+
+    def state_dict(self):
+        """EMA schedule state; averaged model weights are checkpointed separately."""
+        return {
+            "version": 1,
+            "optimization_step": self.optimization_step,
+            "decay": self.decay,
+            "update_after_step": self.update_after_step,
+            "inv_gamma": self.inv_gamma,
+            "power": self.power,
+            "min_value": self.min_value,
+            "max_value": self.max_value,
+        }
+
+    def load_state_dict(self, state):
+        """Restore the update count without resetting or replacing EMA weights."""
+        step = int(state["optimization_step"])
+        if step < 0 or step != state["optimization_step"]:
+            raise ValueError("EMA optimization_step must be a nonnegative integer")
+        decay = float(state.get("decay", self.get_decay(max(step - 1, 0))))
+        if not math.isfinite(decay) or not 0 <= decay <= 1:
+            raise ValueError("EMA decay must be finite and in [0, 1]")
+        for name in ("update_after_step", "inv_gamma", "power", "min_value", "max_value"):
+            if name in state:
+                setattr(self, name, state[name])
+        self.optimization_step = step
+        self.decay = decay
 
     def get_decay(self, optimization_step):
         """

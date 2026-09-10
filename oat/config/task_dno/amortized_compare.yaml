@@ -1,7 +1,0 @@
-# Requires --initializer, trained for this exact base checkpoint and E/F source.
-modes: baseline,amortized,amortized_dno
-episodes: 20
-max_episode_steps: 550
-num_candidates: 4
-num_grad_steps: 3
-teacher_mode: amortized_dno

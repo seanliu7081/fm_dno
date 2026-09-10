@@ -1,8 +1,0 @@
-# Learned heading enters observation features; the source remains IID.
-defaults:
-  - train_flowpolicy_heading_condition
-  - _self_
-
-name: train_flowpolicy_heading_condition_mixed_dit
-policy:
-  backbone_type: mixed_dit

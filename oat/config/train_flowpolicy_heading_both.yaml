@@ -1,7 +1,0 @@
-# F: same conditions as E, plus observation-dependent source canonicalization.
-defaults:
-  - train_flowpolicy_learned_canon
-  - _self_
-name: train_flowpolicy_heading_both
-policy:
-  reference_use: both

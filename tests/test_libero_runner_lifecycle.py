@@ -5,7 +5,6 @@ import pytest
 import torch
 
 from oat.env_runner import libero_runner
-from oat.env_runner.libero_dno_runner import OrbitDnoLiberoRunner
 
 
 class FakeVectorEnv:
@@ -77,7 +76,7 @@ def make_runner(tmp_path, runner_class):
     )
 
 
-@pytest.mark.parametrize('runner_class', [libero_runner.LiberoRunner, OrbitDnoLiberoRunner])
+@pytest.mark.parametrize('runner_class', [libero_runner.LiberoRunner])
 def test_workers_are_lazy_and_released_between_evaluations(tmp_path, vector_envs, runner_class):
     runner = make_runner(tmp_path, runner_class)
     assert not vector_envs
@@ -93,11 +92,11 @@ def test_workers_are_lazy_and_released_between_evaluations(tmp_path, vector_envs
     assert all(env.closed and env.context == 'spawn' for env in vector_envs)
     assert vector_envs[0].init_calls == vector_envs[1].init_calls
     runner.close()  # Safe after cleanup as well.
-    expected = (True, False) if runner_class is OrbitDnoLiberoRunner else (False, True)
+    expected = (False, True)
     assert all(mode == expected for mode in policy.grad_modes)
 
 
-@pytest.mark.parametrize('runner_class', [libero_runner.LiberoRunner, OrbitDnoLiberoRunner])
+@pytest.mark.parametrize('runner_class', [libero_runner.LiberoRunner])
 def test_policy_exception_releases_workers(tmp_path, vector_envs, runner_class):
     runner = make_runner(tmp_path, runner_class)
     with pytest.raises(ValueError, match='policy failed during rollout'):

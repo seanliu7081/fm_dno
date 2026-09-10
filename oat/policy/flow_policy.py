@@ -94,18 +94,18 @@ class FlowPolicy(BasePolicy):
             model = TransformerForDiffusion(
                 **model_kwargs, causal_attn=False, time_as_cond=True, obs_as_cond=True,
             )
-        elif backbone_type == "mixed_dit":
-            from oat.model.flow.mixed_dit import MixedAdaLNZeroTransformer
-
-            model = MixedAdaLNZeroTransformer(**model_kwargs, **extra_kwargs)
         elif backbone_type == "starvla_dit":
             from oat.model.flow.starvla_dit import StarVLAFlowTransformer
 
             model = StarVLAFlowTransformer(**model_kwargs, **extra_kwargs)
+        elif backbone_type == "unet":
+            from oat.model.flow.unet import FlowUnet1D
+
+            model = FlowUnet1D(**model_kwargs, **extra_kwargs)
         else:
             raise ValueError(
                 f"Unknown backbone_type {backbone_type!r}; expected "
-                "'transformer', 'mixed_dit', or 'starvla_dit'"
+                "'transformer', 'starvla_dit', or 'unet'"
             )
 
         self.backbone_type = backbone_type

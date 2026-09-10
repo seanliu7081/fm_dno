@@ -1,0 +1,158 @@
+# Standalone matched heading-flow training configuration.
+# Only task data/shapes are composed; all training and policy settings are here.
+defaults:
+  - task/policy: libero/libero10
+  - _self_
+
+name: train_flowpolicy_headingzero_unet
+_target_: oat.workspace.train_policy.TrainPolicyWorkspace
+
+seed: 42
+horizon: 16
+n_action_steps: 8
+n_obs_steps: 2
+task_name: ${task.policy.name}
+shape_meta: ${task.policy.shape_meta}
+
+policy:
+  _target_: oat.policy.flow_policy_heading_zero.HeadingZeroFlowPolicy
+  shape_meta: ${shape_meta}
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+
+  obs_encoder:
+    _target_: oat.perception.fused_obs_encoder.FusedObservationEncoder
+    _recursive_: false
+    shape_meta: ${shape_meta}
+    vision_encoder:
+      _target_: oat.perception.robomimic_vision_encoder.RobomimicRgbEncoder
+      crop_shape: [116, 116]
+      eval_fixed_crop: true
+    state_encoder:
+      _target_: oat.perception.state_encoder.ProjectionStateEncoder
+      out_dim: null
+
+  # Velocity backbone.
+  backbone_type: unet
+  backbone_kwargs:
+    down_dims: [128, 256, 512]
+    diffusion_step_embed_dim: 128
+    cond_predict_scale: true
+  embed_dim: 256
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.0
+
+  # Straight-path flow matching with ten Euler inference steps.
+  num_inference_steps: 10
+  prior_noise_scale: 1.0
+
+  # Jointly learned heading prediction and observation conditioning.
+  heading_mode: condition
+  heading_hidden_dim: 128
+  heading_horizon: ${horizon}
+  heading_loss_weight: 0.1
+  validity_loss_weight: 0.1
+  min_target_confidence: 0.05
+
+  # Original exact-heading XY noise prior.
+  # heading_xy_rms is fitted from training demonstrations and saved in the policy.
+  source_mode: heading
+  source_jitter: zero
+  source_vector_blocks: [[0, 1]]
+  min_source_confidence: 0.5
+
+training:
+  resume: true
+  allow_bf16: true
+  max_grad_norm: 1.0
+  num_epochs: 61
+  val_every: 5
+  sample_every: 5
+  rollout_every: 50
+  checkpoint_every: 5
+  lr_scheduler: constant_with_warmup
+  lr_warmup_steps: 500
+  gradient_accumulate_every: 1
+  max_train_steps: null
+  max_val_steps: null
+  max_reconst_steps: null
+  seed: ${seed}
+  use_ema: true
+  num_demo: 500
+  tqdm_interval_sec: 60.0
+
+ema:
+  _target_: oat.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+optimizer:
+  policy_lr: 1.0e-4
+  obs_enc_lr: 1.0e-4
+  heading_lr: 1.0e-4
+  weight_decay: 1.0e-6
+  betas: [0.9, 0.999]
+
+dataloader:
+  batch_size: 64
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 2
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+  drop_last: false
+
+# Task-specific heading targets use training data only.
+task:
+  policy:
+    # Preserve the matched recipe: separate immutable-checkpoint evaluation.
+    lazy_eval: true
+    env_runner:
+      n_parallel_envs: 10
+    dataset:
+      _target_: oat.dataset.heading_zarr_dataset.HeadingZarrDataset
+      seed: 42
+      rgb_keys: [agentview_rgb, robot0_eye_in_hand_rgb]
+
+logging:
+  project: oat_dev
+  resume: true
+  mode: offline
+  name: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_seed${seed}
+  tags: ["${name}", "${task_name}", "joint_heading", "predicted_xy_prior", "zero_jitter"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: test_reconst_mse
+    mode: min
+    k: 2
+    format_str: "ep-{epoch:04d}_mse-{test_reconst_mse:.6f}.ckpt"
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+multi_run:
+  run_dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+  wandb_name_base: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_N${training.num_demo}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+  sweep:
+    dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+    subdir: ${hydra.job.num}
