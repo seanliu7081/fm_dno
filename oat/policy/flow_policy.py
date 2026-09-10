@@ -20,6 +20,10 @@ class FlowPolicy(BasePolicy):
     tokens only:
       [ obs (To) ]   -> (B, To, d)
 
+    ``backbone_type`` selects Transformer (``transformer``), U-Net (``unet``),
+    or StarVLA-DiT (``starvla_dit``). All three use the same observation-only
+    objective and sampler, with no heading head, labels, or source transform.
+
     Training (rectified flow):
       x1   = normalized GT action chunk          (B, H, A)
       x0   = sigma * noise                       (pure Gaussian source)

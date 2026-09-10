@@ -1,9 +1,39 @@
 # Flow action backbones
 
 The supported backbones are Transformer, U-Net and StarVLA-DiT. Each is available
-for heading zero and heading Gaussian through the six standalone configs in
-[Heading flow policies](heading_policies.md). Plain `train_flowpolicy.yaml` remains
-the baseline, with Transformer as the default backbone.
+as an observation-only baseline and for heading zero and heading Gaussian.
+See [Heading flow policies](heading_policies.md) for the six heading configs.
+
+## Observation-only baselines
+
+All three baselines use [`FlowPolicy`](../oat/policy/flow_policy.py). The velocity
+model receives encoded observations, the noisy action chunk and flow time. There
+is no heading head, heading condition, auxiliary heading loss or heading-dependent
+source transformation. Training uses straight-path flow matching from independent
+Gaussian noise; inference uses ten Euler steps.
+
+| Backbone | Standalone config | `policy.backbone_type` |
+|---|---|---|
+| Transformer | [train_flowpolicy_transformer](../oat/config/train_flowpolicy_transformer.yaml) | `transformer` |
+| U-Net | [train_flowpolicy_unet](../oat/config/train_flowpolicy_unet.yaml) | `unet` |
+| StarVLA-DiT | [train_flowpolicy_starvlaDiT](../oat/config/train_flowpolicy_starvlaDiT.yaml) | `starvla_dit` |
+
+These configs use the same standalone format, observation encoder, backbone sizes,
+training schedule and checkpoint settings as the corresponding heading-zero
+configs. [`TrainSplitZarrDataset`](../oat/dataset/train_split_zarr_dataset.py)
+preserves their episode split, training-only action/state normalization and fixed
+RGB range without computing heading statistics. The dataset seed stays at 42
+when the model seed changes. Each config specifies policy and encoder learning
+rates of `1e-4`.
+
+```bash
+python scripts/run_workspace.py --config-name=train_flowpolicy_transformer
+python scripts/run_workspace.py --config-name=train_flowpolicy_unet
+python scripts/run_workspace.py --config-name=train_flowpolicy_starvlaDiT
+```
+
+The original `train_flowpolicy.yaml` retains its legacy training settings and
+dataset behavior; use the new standalone configs for matched comparisons.
 
 ## Transformer
 
@@ -53,8 +83,9 @@ budget, evaluator and sampling settings fixed. Backbone parameter counts differ.
 
 ## Retired methods
 
-The plain StarVLA-DiT config was redundant; its backbone remains active. Mixed DiT,
-canonicalization, orbit, blockwise coupling, frozen heading references, reflow and
+An earlier plain StarVLA-DiT config was retired; the standalone baseline above
+provides the current matched training recipe. Mixed DiT, canonicalization, orbit,
+blockwise coupling, frozen heading references, reflow and
 their dependent DNO utilities were removed from the active source tree. Historical
 results and checkpoints remain in `output/`. Their source is recoverable from
 `output/heading_goal/cleanup_unused_methods_20260910/retired_source.tar.gz`.

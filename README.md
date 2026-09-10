@@ -2,8 +2,10 @@
 
 Flow-matching robot policies that predict an XY motion heading from observations
 and use it both to condition the velocity model and to shape its initial noise.
-The repository supports **Heading Zero** and **Heading Gaussian**, each with
-**Transformer, U-Net, or StarVLA-DiT** backbones.
+The repository supports **observation-only baselines**, **Heading Zero** and
+**Heading Gaussian**, each with **Transformer, U-Net, or StarVLA-DiT** backbones.
+The baselines use `FlowPolicy` with Gaussian source noise and no heading head,
+heading condition or auxiliary heading losses.
 
 LIBERO-10 is the verification benchmark. The heading method uses demonstration
 motion labels and observation features, without task-specific geometry or scripted
@@ -110,15 +112,25 @@ action/state normalization and heading-label scale using training episodes only.
 RGB normalization uses the fixed pixel range. Inference restores the learned
 weights and normalization statistics from the checkpoint.
 
-## Six training configurations
+## Standalone training configurations
 
 Each config contains its full policy and training settings and composes only the
 task configuration. The existing `transfomer` filename spelling is preserved.
 
 | Prior | Transformer | U-Net | StarVLA-DiT |
 |---|---|---|---|
+| Baseline Gaussian | [train_flowpolicy_transformer](oat/config/train_flowpolicy_transformer.yaml) | [train_flowpolicy_unet](oat/config/train_flowpolicy_unet.yaml) | [train_flowpolicy_starvlaDiT](oat/config/train_flowpolicy_starvlaDiT.yaml) |
 | Heading Zero | [train_flowpolicy_headingzero_transfomer](oat/config/train_flowpolicy_headingzero_transfomer.yaml) | [train_flowpolicy_headingzero_unet](oat/config/train_flowpolicy_headingzero_unet.yaml) | [train_flowpolicy_headingzero_starvlaDiT](oat/config/train_flowpolicy_headingzero_starvlaDiT.yaml) |
 | Heading Gaussian | [train_flowpolicy_headinggaussian_transfomer](oat/config/train_flowpolicy_headinggaussian_transfomer.yaml) | [train_flowpolicy_headinggaussian_unet](oat/config/train_flowpolicy_headinggaussian_unet.yaml) | [train_flowpolicy_headinggaussian_starvlaDiT](oat/config/train_flowpolicy_headinggaussian_starvlaDiT.yaml) |
+
+The baseline configs match the heading-zero training settings and use
+`TrainSplitZarrDataset` for the same training-only normalization and fixed data
+split, without heading statistics. See [the baseline guide](docs/flow_backbones.md#observation-only-baselines)
+for all three commands. For example:
+
+```bash
+python scripts/run_workspace.py --config-name=train_flowpolicy_unet
+```
 
 For example, train Heading Gaussian with U-Net on GPU 0:
 
