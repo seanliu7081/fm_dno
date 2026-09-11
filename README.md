@@ -13,8 +13,8 @@ motion phases. Evaluation uses one policy checkpoint across all tasks.
 
 ## Experiment results
 
-Latest completed 500-episode LIBERO-10 evaluation per policy. SR = success rate;
-DiT = StarVLA-DiT.
+Best SR among completed 500-episode LIBERO-10 checkpoint evaluations for each
+policy. SR = success rate; DiT = StarVLA-DiT.
 
 | Policy used | SR |
 |---|---:|
@@ -23,9 +23,9 @@ DiT = StarVLA-DiT.
 | [Baseline / DiT](output/eval_comparison_ep50_ep55_20260910T234741Z/baseline_dit/summary.json) | 81.8% |
 | [Heading Zero / Transformer](output/eval_comparison_ep50_ep55_20260910T234741Z/headingzero_transformer/summary.json) | 74.2% |
 | [Heading Zero / U-Net](output/eval_comparison_ep50_ep55_20260910T234741Z/headingzero_unet/summary.json) | 75.4% |
-| [Heading Zero / DiT](output/heading_goal/starvla_dit_150_online_20260910/rollouts/epoch_075/attempt_001/summary.json) | 77.2% |
-| [Heading Gaussian / Transformer](output/20260911/001720_train_flowpolicy_headinggaussian_transfomer_libero10_N500/rollouts/epoch_060/attempt_001/summary.json) | 74.8% |
-| [Heading Gaussian / U-Net](output/20260911/001648_train_flowpolicy_headinggaussian_unet_libero10_N500/rollouts/epoch_060/attempt_001/summary.json) | 74.8% |
+| [Heading Zero / DiT](output/heading_goal/starvla_dit_150_online_20260910/rollouts/epoch_030/attempt_001/summary.json) | 80.0% |
+| [Heading Gaussian / Transformer](output/20260911/001720_train_flowpolicy_headinggaussian_transfomer_libero10_N500/rollouts/epoch_040/attempt_001/summary.json) | 75.0% |
+| [Heading Gaussian / U-Net](output/20260911/001648_train_flowpolicy_headinggaussian_unet_libero10_N500/rollouts/epoch_020/attempt_001/summary.json) | 76.8% |
 | [Heading Gaussian / DiT](output/20260911/001512_train_flowpolicy_headinggaussian_starvlaDiT_libero10_N500/rollouts/epoch_060/attempt_001/summary.json) | 79.0% |
 
 ## Model design
