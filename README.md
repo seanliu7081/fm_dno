@@ -11,6 +11,154 @@ LIBERO-10 is the verification benchmark. The heading method uses demonstration
 motion labels and observation features, without task-specific geometry or scripted
 motion phases. Evaluation uses one policy checkpoint across all tasks.
 
+## Experiment results
+
+SR is the LIBERO-10 success rate. Each row identifies the evaluated policy and
+checkpoint; results are grouped by evaluation protocol.
+
+### Baseline and Heading Zero comparison
+
+500 episodes per policy. Checkpoint epochs are zero-based. All recent 500-episode
+evaluations below use 50 official initial states per task, seed 20260911, ten
+settling steps and a 550-action limit.
+
+| Policy used | SR |
+|---|---:|
+| [Baseline Gaussian / Transformer (checkpoint epoch 55)](output/eval_comparison_ep50_ep55_20260910T234741Z/baseline_transformer/summary.json) | 76.8% |
+| [Baseline Gaussian / U-Net (checkpoint epoch 50)](output/eval_comparison_ep50_ep55_20260910T234741Z/baseline_unet/summary.json) | 73.6% |
+| [Baseline Gaussian / StarVLA-DiT (checkpoint epoch 50)](output/eval_comparison_ep50_ep55_20260910T234741Z/baseline_dit/summary.json) | 81.8% |
+| [Heading Zero / Transformer (checkpoint epoch 55)](output/eval_comparison_ep50_ep55_20260910T234741Z/headingzero_transformer/summary.json) | 74.2% |
+| [Heading Zero / U-Net (checkpoint epoch 50)](output/eval_comparison_ep50_ep55_20260910T234741Z/headingzero_unet/summary.json) | 75.4% |
+
+### Heading Gaussian checkpoint evaluations
+
+500 episodes per policy; epoch counts below are completed training epochs.
+
+| Policy used | SR |
+|---|---:|
+| [Heading Gaussian / Transformer (10 epochs)](output/20260911/001720_train_flowpolicy_headinggaussian_transfomer_libero10_N500/rollouts/epoch_010/attempt_001/summary.json) | 54.8% |
+| [Heading Gaussian / Transformer (20 epochs)](output/20260911/001720_train_flowpolicy_headinggaussian_transfomer_libero10_N500/rollouts/epoch_020/attempt_001/summary.json) | 67.2% |
+| [Heading Gaussian / Transformer (30 epochs)](output/20260911/001720_train_flowpolicy_headinggaussian_transfomer_libero10_N500/rollouts/epoch_030/attempt_001/summary.json) | 69.6% |
+| [Heading Gaussian / Transformer (40 epochs)](output/20260911/001720_train_flowpolicy_headinggaussian_transfomer_libero10_N500/rollouts/epoch_040/attempt_001/summary.json) | 75.0% |
+| [Heading Gaussian / Transformer (50 epochs)](output/20260911/001720_train_flowpolicy_headinggaussian_transfomer_libero10_N500/rollouts/epoch_050/attempt_001/summary.json) | 72.4% |
+| [Heading Gaussian / Transformer (60 epochs)](output/20260911/001720_train_flowpolicy_headinggaussian_transfomer_libero10_N500/rollouts/epoch_060/attempt_001/summary.json) | 74.8% |
+| [Heading Gaussian / U-Net (10 epochs)](output/20260911/001648_train_flowpolicy_headinggaussian_unet_libero10_N500/rollouts/epoch_010/attempt_001/summary.json) | 73.4% |
+| [Heading Gaussian / U-Net (20 epochs)](output/20260911/001648_train_flowpolicy_headinggaussian_unet_libero10_N500/rollouts/epoch_020/attempt_001/summary.json) | 76.8% |
+| [Heading Gaussian / U-Net (30 epochs)](output/20260911/001648_train_flowpolicy_headinggaussian_unet_libero10_N500/rollouts/epoch_030/attempt_001/summary.json) | 74.8% |
+| [Heading Gaussian / U-Net (40 epochs)](output/20260911/001648_train_flowpolicy_headinggaussian_unet_libero10_N500/rollouts/epoch_040/attempt_001/summary.json) | 73.8% |
+| [Heading Gaussian / U-Net (50 epochs)](output/20260911/001648_train_flowpolicy_headinggaussian_unet_libero10_N500/rollouts/epoch_050/attempt_001/summary.json) | 76.0% |
+| [Heading Gaussian / U-Net (60 epochs)](output/20260911/001648_train_flowpolicy_headinggaussian_unet_libero10_N500/rollouts/epoch_060/attempt_001/summary.json) | 74.8% |
+| [Heading Gaussian / StarVLA-DiT (10 epochs)](output/20260911/001512_train_flowpolicy_headinggaussian_starvlaDiT_libero10_N500/rollouts/epoch_010/attempt_001/summary.json) | 70.8% |
+| [Heading Gaussian / StarVLA-DiT (20 epochs)](output/20260911/001512_train_flowpolicy_headinggaussian_starvlaDiT_libero10_N500/rollouts/epoch_020/attempt_001/summary.json) | 73.8% |
+| [Heading Gaussian / StarVLA-DiT (30 epochs)](output/20260911/001512_train_flowpolicy_headinggaussian_starvlaDiT_libero10_N500/rollouts/epoch_030/attempt_001/summary.json) | 77.2% |
+| [Heading Gaussian / StarVLA-DiT (40 epochs)](output/20260911/001512_train_flowpolicy_headinggaussian_starvlaDiT_libero10_N500/rollouts/epoch_040/attempt_001/summary.json) | 76.8% |
+| [Heading Gaussian / StarVLA-DiT (50 epochs)](output/20260911/001512_train_flowpolicy_headinggaussian_starvlaDiT_libero10_N500/rollouts/epoch_050/attempt_001/summary.json) | 73.8% |
+| [Heading Gaussian / StarVLA-DiT (60 epochs)](output/20260911/001512_train_flowpolicy_headinggaussian_starvlaDiT_libero10_N500/rollouts/epoch_060/attempt_001/summary.json) | 79.0% |
+
+### Heading Zero / StarVLA-DiT online run
+
+500 episodes per policy; epoch counts below are completed training epochs.
+
+| Policy used | SR |
+|---|---:|
+| [Heading Zero / StarVLA-DiT (15 epochs)](output/heading_goal/starvla_dit_150_online_20260910/rollouts/epoch_015/attempt_001/summary.json) | 72.8% |
+| [Heading Zero / StarVLA-DiT (30 epochs)](output/heading_goal/starvla_dit_150_online_20260910/rollouts/epoch_030/attempt_001/summary.json) | 80.0% |
+| [Heading Zero / StarVLA-DiT (45 epochs)](output/heading_goal/starvla_dit_150_online_20260910/rollouts/epoch_045/attempt_001/summary.json) | 77.6% |
+| [Heading Zero / StarVLA-DiT (60 epochs)](output/heading_goal/starvla_dit_150_online_20260910/rollouts/epoch_060/attempt_001/summary.json) | 78.4% |
+| [Heading Zero / StarVLA-DiT (75 epochs)](output/heading_goal/starvla_dit_150_online_20260910/rollouts/epoch_075/attempt_001/summary.json) | 77.2% |
+
+<details>
+<summary>Earlier experiments</summary>
+
+Historical values below are taken from the preserved experiment reports.
+
+**Heading-policy evaluation — 500 episodes, ten settling steps.** [Source](docs/heading_goal_20260910.md#final-verified-result).
+
+| Policy used | SR |
+|---|---:|
+| Transformer + exact heading prior (epoch 15) | 63.0% |
+| U-Net + exact heading prior (epoch 15) | 75.2% |
+| StarVLA-DiT + exact heading prior (epoch 15) | 77.0% |
+| U-Net + Gaussian heading prior (epoch 15) | 76.4% |
+| U-Net + Gaussian heading prior (epoch 20 / latest) | 76.0% |
+
+**Previously reserved 400-state subset of those evaluations.** [Source](docs/heading_goal_20260910.md#additional-evaluation-epoch-20-and-latest).
+
+| Policy used | SR |
+|---|---:|
+| U-Net + Gaussian heading prior (epoch 15) | 74.5% |
+| U-Net + Gaussian heading prior (epoch 20 / latest) | 75.25% |
+
+**Heading-policy development pilots — 100 episodes each.** [Sources: epoch 5](docs/heading_goal_20260910.md#first-complete-development-pilots-checkpoint-epoch-5), [epoch 15](docs/heading_goal_20260910.md#checkpoint-selection-epoch-15).
+
+| Policy used | SR |
+|---|---:|
+| Transformer + exact heading prior (epoch 5) | 30.0% |
+| U-Net + exact heading prior (epoch 5) | 58.0% |
+| U-Net + Gaussian heading prior (epoch 5) | 64.0% |
+| DINO + Gaussian heading prior (epoch 5) | 58.0% |
+| Transformer + exact heading prior (epoch 15) | 62.0% |
+| U-Net + exact heading prior (epoch 15) | 82.0% |
+| U-Net + Gaussian heading prior (epoch 15) | 82.0% |
+| DINO + Gaussian heading prior (epoch 15) | 70.0% |
+
+**Original baselines — mean of three 500-episode evaluations.** [Source](RUNLOG.md#phase-2-results--p1-complete-and-gate-g6).
+
+| Policy used | SR |
+|---|---:|
+| P0 baseline | 18.60% |
+| P1 SO(2) normalization only | 20.13% |
+
+**Orbit-coupling comparison — 50 episodes.** [Source](RUNLOG.md#success-rate-summary-50-episode-protocol-matched).
+
+| Policy used | SR |
+|---|---:|
+| P1 IID control, DNO off | 22.0% |
+| P4 target-heading coupling, DNO off | 0.0% |
+| P5 target-heading coupling + matched prior, DNO off | 0.0% |
+| P4 + stage-1 orbit DNO, K=32 | 2.0% |
+
+**Additional historical standalone result — evaluation size unspecified.** [Source](RUN_SUMMARY.md#1-the-four-findings).
+
+| Policy used | SR |
+|---|---:|
+| P4 target-heading coupling | 0.8% |
+
+**Coupling comparison — best 50-episode training rollout.** [Source](RUN_SUMMARY.md#4-gate-m3--the-verdict).
+
+| Policy used | SR |
+|---|---:|
+| P1 IID control (epoch 600) | 40.0% |
+| A1 observation-canonicalized source (epoch 250) | 52.0% |
+| B1 blockwise coupling (epoch 750) | 38.0% |
+
+**Coupling comparison — fixed-checkpoint 500-episode evaluation, 10 Euler steps.** [Source](RUNLOG.md#2026-08-30--gate-m3-both-constructions-are-null-and-the-0065-bar-was-never-reachable).
+
+| Policy used | SR |
+|---|---:|
+| P1 IID control (epoch 600) | 34.2% |
+| A1 observation-canonicalized source (epoch 250) | 30.2% |
+| B1 blockwise coupling (epoch 750) | 33.4% |
+
+**Few-step sweep — P1 epoch 600, 500 episodes, standard prior, DNO off.** [Source](RUN_SUMMARY.md#2-phase-f0--the-few-step-sweep). The 10-step result is listed in the table above.
+
+| Policy used | SR |
+|---|---:|
+| P1 IID control, 1 Euler step | 24.0% |
+| P1 IID control, 2 Euler steps | 30.6% |
+| P1 IID control, 4 Euler steps | 33.2% |
+
+**Earlier few-step sweep — P1 epoch 600, 200 episodes, standard prior, DNO off.** [Source](RUNLOG.md#2026-08-27--gate-f0a-no-headroom-the-baseline-already-runs-at-n2-for-free).
+
+| Policy used | SR |
+|---|---:|
+| P1 IID control, 1 Euler step | 27.5% |
+| P1 IID control, 2 Euler steps | 36.0% |
+| P1 IID control, 4 Euler steps | 28.0% |
+| P1 IID control, 10 Euler steps | 34.5% |
+
+</details>
+
 ## Model design
 
 ```text
