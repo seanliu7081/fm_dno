@@ -1,0 +1,66 @@
+# Matched six-task MimicGen run: two DDP ranks, inline rollouts on both ranks.
+defaults:
+  - train_flowpolicy_headinggaussian_starvlaDiT
+  - override task/policy: mimicgen/mimicgen6
+  - _self_
+
+name: train_mimicgen6_headinggaussian_dit
+
+training:
+  expected_num_processes: 2
+  num_epochs: 600
+  num_demo: 100
+  rollout_every: 50
+  rollout_epoch_offset: 1
+  checkpoint_every: 1
+  val_every: 50
+  sample_every: 50
+
+task:
+  policy:
+    lazy_eval: false
+    distributed_eval: true
+    env_runner:
+      n_parallel_envs: 4
+    dataset:
+      val_ratio: 0.0
+
+dataloader:
+  # Per GPU; two ranks give a global batch size of 128.
+  batch_size: 64
+  num_workers: 4
+
+logging:
+  project: fm_dno_mimicgen
+  group: mimicgen6_N100_dit
+  name: ${name}_seed${seed}
+  tags: [mimicgen6, multitask, delta_action, dit, headinggaussian, ddp2]
+
+checkpoint:
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 2
+    format_str: "ep-{epoch:04d}_success-{test_mean_score:.4f}.ckpt"
+  save_rollout_ckpt: true
+  save_final_ckpt: true
+
+# Ground-truth actions from the same 50 held-out demos per task as rollouts.
+# This independent dataset never enters training or normalizer fitting.
+action_mse:
+  enabled: true
+  every: 50
+  evaluate_first_epoch: true
+  seed: 20260912
+  batch_size: 64
+  num_workers: 2
+  manifest_path: data/mimicgen/mimicgen6_action_mse.manifest.json
+  dataset:
+    _target_: oat.dataset.zarr_dataset.ZarrDataset
+    zarr_path: data/mimicgen/mimicgen6_action_mse.zarr
+    obs_keys: ${task.policy.dataset.obs_keys}
+    action_key: action
+    n_obs_steps: ${n_obs_steps}
+    n_action_steps: ${horizon}
+    seed: ${seed}
+    val_ratio: 0.0

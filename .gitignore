@@ -3,3 +3,6 @@ output/
 *.DS_Store
 *__pycache__/
 *.ckpt
+
+third_party/mimicgen/
+third_party/robosuite-task-zoo/

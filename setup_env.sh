@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 # =============================================================
 # OAT Environment Setup Script
-# Reproduces the oat dev environment on a fresh Ubuntu machine.
+# Reproduces the fm_dno Conda environment on a fresh Ubuntu machine.
 #
 # Prerequisites:
 #   - Ubuntu 22.04+ (x86_64)
 #   - NVIDIA GPU with driver >= 570 (for CUDA 12.9)
-#   - Git
+#   - Git and Conda
 #
 # Usage:
 #   chmod +x setup_env.sh
-#   ./setup_env.sh [--venv-path /path/to/venv]  # default: ./venv/oat
+#   ./setup_env.sh [--env-name fm_dno]
 # =============================================================
 
 set -euo pipefail
 
 # ---- Config ----
 PYTHON_VERSION="3.10"
-VENV_PATH="./venv/oat"
+ENV_NAME="fm_dno"
 CUDA_VERSION="auto"  # auto-detect, or override with --cuda 12.8 / 12.9
 
 # Parse args
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --venv-path) VENV_PATH="$2"; shift 2 ;;
+        --env-name) ENV_NAME="$2"; shift 2 ;;
         --cuda) CUDA_VERSION="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
@@ -63,7 +63,7 @@ echo "===== OAT Environment Setup ====="
 echo "Python version : ${PYTHON_VERSION}"
 echo "CUDA version   : ${CUDA_VERSION}"
 echo "PyTorch index  : ${TORCH_INDEX}"
-echo "Venv path      : ${VENV_PATH}"
+echo "Conda env      : ${ENV_NAME}"
 echo ""
 
 # ---- 1. System dependencies ----
@@ -77,10 +77,14 @@ sudo apt-get install -y -qq \
     > /dev/null 2>&1
 echo "  Done."
 
-# ---- 2. Create virtual environment ----
-echo "[2/6] Creating virtual environment at ${VENV_PATH}..."
-python${PYTHON_VERSION} -m venv "${VENV_PATH}"
-source "${VENV_PATH}/bin/activate"
+# ---- 2. Create Conda environment ----
+echo "[2/6] Creating Conda environment ${ENV_NAME}..."
+if ! command -v conda >/dev/null 2>&1; then
+    source /opt/miniforge3/etc/profile.d/conda.sh
+fi
+eval "$(conda shell.bash hook)"
+conda create --name "${ENV_NAME}" python="${PYTHON_VERSION}" pip -y
+conda activate "${ENV_NAME}"
 pip install --upgrade pip setuptools wheel > /dev/null 2>&1
 echo "  Done. Python: $(python --version)"
 
@@ -176,4 +180,4 @@ print(f'  libero        : imported OK')
 
 echo ""
 echo "===== Setup complete! ====="
-echo "Activate with:  source ${VENV_PATH}/bin/activate"
+echo "Activate with:  conda activate ${ENV_NAME}"

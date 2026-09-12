@@ -2,7 +2,7 @@
 """Evaluate one immutable flow-policy checkpoint on official LIBERO states.
 
 Example (100-episode pilot):
-  CUDA_VISIBLE_DEVICES=3 /venv/oat/bin/python scripts/eval_heading_policy.py \
+  CUDA_VISIBLE_DEVICES=3 /venv/fm_dno/bin/python scripts/eval_heading_policy.py \
     -c output/run/checkpoints/ep-0200.ckpt -o output/eval/pilot \
     --n-per-task 10 --seed 20260910 --workers 4
 

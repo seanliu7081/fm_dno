@@ -1,4 +1,4 @@
-name: oat
+name: fm_dno
 channels:
   - conda-forge
 

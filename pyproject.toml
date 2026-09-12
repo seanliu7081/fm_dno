@@ -21,7 +21,7 @@ dependencies = [
     "torchvision>=0.25.0",
     "vector-quantize-pytorch>=1.27.19",
     "robomimic==0.2.0",
-    "robosuite==1.4.0",
+    "robosuite>=1.4.0,<1.5",
     "easydict>=1.13",
     "bddl>=3.6.0",
     "cloudpickle>=3.1.2",
@@ -30,6 +30,9 @@ dependencies = [
     "gym>=0.26.2",
     "pandas>=2.3.3",
 ]
+
+[project.optional-dependencies]
+mimicgen = ["robosuite==1.4.1", "mujoco==3.2.6", "chardet"]
 
 [project.urls]
 Repository = "https://github.com/Chaoqi-LIU/oat"

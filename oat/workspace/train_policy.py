@@ -12,6 +12,7 @@ import random
 import warnings
 import numpy as np
 from collections.abc import Mapping
+from contextlib import contextmanager
 import hydra
 from datetime import timedelta
 import torch
@@ -66,6 +67,132 @@ def _epoch_events(epoch, training, *, lazy_eval, save_rollout_checkpoint=False,
         or (save_final_checkpoint and epoch + 1 == training.num_epochs)
     )
     return rollout_due, checkpoint_due
+
+
+def _merge_rollout_logs(rank_logs):
+    """Combine episode counts, never unweighted averages of rank-local rates.
+
+    Distributed runners return ``_eval_counts={metric: (successes, episodes)}``.
+    All other keys must be rank-unique (for example, per-episode video paths).
+    Requiring counts avoids silently reporting an incorrect mean for uneven shards.
+    """
+    totals = {}
+    merged = {}
+    expected_metrics = None
+    for rank, log in enumerate(rank_logs):
+        if not isinstance(log, Mapping):
+            raise ValueError(f"Evaluation rank {rank} did not return a metric mapping")
+        counts = log.get('_eval_counts')
+        if not isinstance(counts, Mapping) or not counts:
+            raise ValueError(f"Evaluation rank {rank} must return nonempty _eval_counts")
+        if expected_metrics is None:
+            expected_metrics = set(counts)
+        elif set(counts) != expected_metrics:
+            raise ValueError("Evaluation ranks returned different metric names")
+        for key, pair in counts.items():
+            if len(pair) != 2:
+                raise ValueError(f"Invalid evaluation counts for {key}: {pair}")
+            successes, episodes = map(float, pair)
+            if (not np.isfinite(successes) or not np.isfinite(episodes)
+                    or not 0 <= successes <= episodes
+                    or not successes.is_integer() or not episodes.is_integer()):
+                raise ValueError(f"Invalid evaluation counts for {key}: {pair}")
+            previous = totals.setdefault(key, [0, 0])
+            previous[0] += int(successes)
+            previous[1] += int(episodes)
+        for key, value in log.items():
+            if key == '_eval_counts':
+                continue
+            if key in merged or key in counts:
+                raise ValueError(f"Distributed evaluation log key must be rank-unique: {key}")
+            merged[key] = value
+    for key, (successes, episodes) in totals.items():
+        if episodes == 0:
+            raise ValueError(f"Evaluation metric {key} has no episodes")
+        merged[key] = successes / episodes
+        merged[f'{key}/successes'] = successes
+        merged[f'{key}/episodes'] = episodes
+    return merged
+
+
+@contextmanager
+def _preserve_training_rng(device):
+    """Simulator resets and policy sampling must not reseed subsequent training."""
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    cuda_devices = [device.index] if device.type == 'cuda' else []
+    try:
+        with torch.random.fork_rng(devices=cuda_devices):
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+
+
+def _run_distributed_rollout(env_runner, policy, accelerator, *, epoch, global_step):
+    """Run local inference on every training GPU and propagate rank failures.
+
+    ``policy`` must be unwrapped: ranks finish different numbers of simulator
+    steps, so DDP forward-time buffer broadcasts could otherwise deadlock.
+    """
+    try:
+        with _preserve_training_rng(accelerator.device):
+            log = env_runner.run(policy, epoch=epoch, global_step=global_step)
+        result = {'log': log, 'error': None}
+    except Exception as error:
+        result = {'log': None, 'error': f'{type(error).__name__}: {error}'}
+    results = [result]
+    if accelerator.num_processes > 1:
+        results = [None] * accelerator.num_processes
+        torch.distributed.all_gather_object(results, result)
+    errors = [f'rank {rank}: {item["error"]}' for rank, item in enumerate(results)
+              if item['error'] is not None]
+    if errors:
+        raise RuntimeError('Distributed rollout failed; ' + '; '.join(errors))
+    return _merge_rollout_logs([item['log'] for item in results])
+
+
+
+def _action_mse_due(epoch, options, *, first_epoch):
+    if options is None or not options.get('enabled', True):
+        return False
+    every = int(options.get('every', 50))
+    if every < 1:
+        raise ValueError("Action MSE interval must be positive")
+    return ((epoch + 1) % every == 0
+            or (options.get('evaluate_first_epoch', True) and epoch == first_epoch))
+
+
+def _run_action_mse(policy, dataset, accelerator, options, *, completed_epochs):
+    """Evaluate disjoint full-window shards; surface any rank failure to all ranks."""
+    from oat.common.action_mse import evaluate_action_mse, merge_action_mse_results
+    import json
+    try:
+        manifest_path = pathlib.Path(options.manifest_path)
+        manifest = json.loads(manifest_path.read_text())
+        task_names = {int(task['task_uid']): task['task_name'] for task in manifest['tasks']}
+        with _preserve_training_rng(accelerator.device):
+            result = evaluate_action_mse(
+                policy, dataset, device=accelerator.device,
+                rank=accelerator.process_index, world_size=accelerator.num_processes,
+                batch_size=int(options.get('batch_size', 64)),
+                num_workers=int(options.get('num_workers', 2)),
+                seed=int(options.get('seed', 20260912)), task_names=task_names,
+            )
+        local = {'result': result, 'error': None}
+    except Exception as error:
+        local = {'result': None, 'error': f'{type(error).__name__}: {error}'}
+    results = [local]
+    if accelerator.num_processes > 1:
+        results = [None] * accelerator.num_processes
+        torch.distributed.all_gather_object(results, local)
+    failures = [f"rank {rank}: {item['error']}" for rank, item in enumerate(results)
+                if item['error'] is not None]
+    if failures:
+        raise RuntimeError('Distributed action MSE failed; ' + '; '.join(failures))
+    log = merge_action_mse_results([item['result'] for item in results], task_names=task_names)
+    log['test_reconst_mse'] = log['val/action_mse']
+    log['action_mse/completed_epochs'] = int(completed_epochs)
+    return log
 
 
 def _clip_grad_norm(accelerator, model, optimizer, max_norm):
@@ -266,6 +393,14 @@ class TrainPolicyWorkspace(BaseWorkspace):
             mixed_precision="bf16" if cfg.training.allow_bf16 and detect_bf16_support() else "no",
         )
         device = accelerator.device
+        expected_processes = cfg.training.get('expected_num_processes')
+        if expected_processes is not None:
+            if accelerator.num_processes != int(expected_processes):
+                raise RuntimeError(
+                    f"This run requires {expected_processes} training processes; "
+                    f"received {accelerator.num_processes}. Launch with torchrun.")
+            if int(expected_processes) > 1 and device.type != 'cuda':
+                raise RuntimeError("This run requires one CUDA GPU per training process")
 
         # set seed
         seed = int(cfg.training.seed)
@@ -283,7 +418,17 @@ class TrainPolicyWorkspace(BaseWorkspace):
             cfg.task.policy.dataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         val_dataset = dataset.get_validation_dataset()
+        has_validation = len(val_dataset) > 0
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
+
+        # The optional held-out action dataset is evaluated only: it never fits
+        # normalizers or contributes gradients / heading training statistics.
+        action_mse_options = cfg.get('action_mse')
+        action_mse_dataset = None
+        if action_mse_options is not None and action_mse_options.get('enabled', True):
+            action_mse_dataset = hydra.utils.instantiate(action_mse_options.dataset)
+            if len(action_mse_dataset) == 0:
+                raise ValueError("Action MSE dataset is empty")
 
         # configure normalizer
         normalizer = dataset.get_normalizer()
@@ -301,10 +446,16 @@ class TrainPolicyWorkspace(BaseWorkspace):
 
         # configure env
         lazy_eval = cfg.task.policy.lazy_eval  # don't eval during training
-        if (not lazy_eval) and accelerator.is_main_process:
+        distributed_eval = bool(cfg.task.policy.get('distributed_eval', False))
+        env_runner = None
+        if (not lazy_eval) and (distributed_eval or accelerator.is_main_process):
+            runner_kwargs = {}
+            if distributed_eval:
+                runner_kwargs.update(rank=accelerator.process_index,
+                                     world_size=accelerator.num_processes, device=device)
             env_runner: BaseRunner = hydra.utils.instantiate(
                 cfg.task.policy.env_runner,
-                output_dir=self.output_dir
+                output_dir=self.output_dir, **runner_kwargs,
             )
 
         # resume training
@@ -339,6 +490,8 @@ class TrainPolicyWorkspace(BaseWorkspace):
         if cfg.training.use_ema:
             self.ema_model = accelerator.prepare(self.ema_model)
         len_train_dataloader = len(train_dataloader)
+        if len_train_dataloader == 0:
+            raise ValueError("Training DataLoader contains no batches after distributed sharding")
         ema, lr_scheduler = self._create_training_dynamics(
             cfg, len_train_dataloader,
             accelerator.unwrap_model(self.ema_model) if cfg.training.use_ema else None,
@@ -353,17 +506,32 @@ class TrainPolicyWorkspace(BaseWorkspace):
             config=OmegaConf.to_container(cfg, resolve=True),
             init_kwargs={"wandb": wandb_cfg}
         )
+        wandb_step_offset = 0
         if accelerator.is_main_process:
-            accelerator.get_tracker("wandb").run.config.update({
-                "output_dir": str(self.output_dir)
-            })
+            wandb_run = accelerator.get_tracker("wandb").run
+            wandb_run.config.update({"output_dir": str(self.output_dir)})
+            # Uploaded partial epochs / offline fragments can put W&B's history
+            # ahead of the checkpoint. Keep its transport step monotonic while
+            # preserving the true optimizer/global_step in the logged values.
+            if cfg.logging.get('mode') == 'online':
+                wandb_step_offset = max(0, int(getattr(wandb_run, 'step', 0)) - self.global_step)
+                define_metric = getattr(wandb_run, 'define_metric', None)
+                if callable(define_metric):
+                    define_metric('global_step')
+                    define_metric('*', step_metric='global_step')
+                    define_metric('action_mse/completed_epochs')
+                    define_metric('val/*', step_metric='action_mse/completed_epochs')
+                    define_metric('test_reconst_mse', step_metric='action_mse/completed_epochs')
+                wandb_run.config.update({'wandb_step_offset': wandb_step_offset}, allow_val_change=True)
 
         # Restore after construction, device preparation, and tracker setup,
         # which can consume RNG draws unrelated to the continuation.
         self._restore_training_rng(accelerator)
 
         # training loop
-        with JsonLogger(os.path.join(self.output_dir, 'logs.json')) as json_logger:
+        first_run_epoch = self.epoch
+        log_path = os.path.join(self.output_dir, 'logs.json') if accelerator.is_main_process else None
+        with JsonLogger(log_path) as json_logger:
             while self.epoch < cfg.training.num_epochs:
 
                 if accelerator.is_main_process:
@@ -429,7 +597,7 @@ class TrainPolicyWorkspace(BaseWorkspace):
                                     'lr': lr_scheduler.get_last_lr()[0],
                                 }
                                 if not is_last_batch:
-                                    accelerator.log(step_log, step=self.global_step)
+                                    accelerator.log(step_log, step=self.global_step + wandb_step_offset)
                                     json_logger.log(step_log)
 
                             # increment global step
@@ -448,6 +616,7 @@ class TrainPolicyWorkspace(BaseWorkspace):
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
                     step_log['train_loss'] = (loss_info[0] / loss_info[1]).item()
+                    step_log['completed_epochs'] = self.epoch + 1
 
                 # ========= eval for this epoch ==========
                 policy = accelerator.unwrap_model(self.model)
@@ -462,9 +631,16 @@ class TrainPolicyWorkspace(BaseWorkspace):
                 )
                 # A checkpoint-aware runner isolates simulator RNG and returns
                 # metrics to this training run after a fixed-policy evaluation.
-                if not lazy_eval:
+                if rollout_due:
                     accelerator.wait_for_everyone()
-                    if accelerator.is_main_process and rollout_due:
+                    if distributed_eval:
+                        runner_log = _run_distributed_rollout(
+                            env_runner, policy, accelerator,
+                            epoch=self.epoch, global_step=self.global_step,
+                        )
+                        if accelerator.is_main_process:
+                            step_log.update(runner_log)
+                    elif accelerator.is_main_process:
                         run_checkpoint = getattr(env_runner, 'run_checkpoint', None)
                         if callable(run_checkpoint):
                             runner_log = run_checkpoint(
@@ -474,8 +650,19 @@ class TrainPolicyWorkspace(BaseWorkspace):
                         step_log.update(runner_log)
                     accelerator.wait_for_everyone()
 
+                if action_mse_dataset is not None and _action_mse_due(
+                        self.epoch, action_mse_options, first_epoch=first_run_epoch):
+                    accelerator.print(f"Evaluating held-out action MSE after epoch {self.epoch + 1}")
+                    action_mse_log = _run_action_mse(
+                        policy, action_mse_dataset, accelerator, action_mse_options,
+                        completed_epochs=self.epoch + 1,
+                    )
+                    if accelerator.is_main_process:
+                        step_log.update(action_mse_log)
+                        accelerator.print(f"Held-out action MSE: {action_mse_log['val/action_mse']:.6f}")
+
                 # run validation
-                if (self.epoch % cfg.training.val_every) == 0:
+                if has_validation and (self.epoch % cfg.training.val_every) == 0:
                     loss_info = torch.zeros(2, device=device)   # [total loss, total batch_size]
                     with torch.inference_mode():
                         with tqdm.tqdm(
@@ -511,7 +698,7 @@ class TrainPolicyWorkspace(BaseWorkspace):
                         step_log['val_loss'] = (loss_info[0] / loss_info[1]).item()
 
                 # action prediction eval
-                if self.epoch % cfg.training.sample_every == 0:
+                if has_validation and self.epoch % cfg.training.sample_every == 0:
                     loss_info = torch.zeros(2, device=device)   # [total loss, total batch_size]
                     with torch.inference_mode():
                         with tqdm.tqdm(
@@ -595,7 +782,7 @@ class TrainPolicyWorkspace(BaseWorkspace):
                 # end of epoch
                 # log of last step is combined with validation and rollout
                 if accelerator.is_main_process:
-                    accelerator.log(step_log, step=self.global_step)
+                    accelerator.log(step_log, step=self.global_step + wandb_step_offset)
                     json_logger.log(step_log)
 
                 # increment epoch and global step
@@ -609,7 +796,7 @@ class TrainPolicyWorkspace(BaseWorkspace):
         # clean up
         if not lazy_eval:
             accelerator.wait_for_everyone()
-            if accelerator.is_main_process and (not lazy_eval):
+            if env_runner is not None:
                 env_runner.close()
             accelerator.wait_for_everyone()
         accelerator.end_training()

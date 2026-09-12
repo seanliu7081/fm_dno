@@ -1,0 +1,55 @@
+name: mimicgen6
+task_name: mimicgen6
+lazy_eval: false
+distributed_eval: true
+
+shape_meta:
+  obs:
+    agentview_rgb:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_eye_in_hand_rgb:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_eef_pos:
+      shape: [3]
+      type: state
+    robot0_eef_quat:
+      shape: [4]
+      type: state
+    robot0_gripper_qpos:
+      shape: [2]
+      type: state
+    task_uid:
+      shape: [1]
+      type: state
+  action:
+    shape: [7]
+
+env_runner:
+  _target_: oat.env_runner.mimicgen_runner.MimicGenRunner
+  manifest_path: data/mimicgen/mimicgen6_N100.manifest.json
+  n_per_task: 50
+  n_parallel_envs: 4
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  image_size: 128
+  seed: 20260912
+
+dataset:
+  _target_: oat.dataset.heading_zarr_dataset.HeadingZarrDataset
+  zarr_path: data/mimicgen/mimicgen6_N100.zarr
+  obs_keys:
+    - agentview_rgb
+    - robot0_eye_in_hand_rgb
+    - robot0_eef_pos
+    - robot0_eef_quat
+    - robot0_gripper_qpos
+    - task_uid
+  action_key: action
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${horizon}
+  seed: ${seed}
+  # All 100 demonstrations per task train; rollout states are separate.
+  val_ratio: 0.0
+  rgb_keys: [agentview_rgb, robot0_eye_in_hand_rgb]

@@ -16,6 +16,6 @@ export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
 export MUJOCO_EGL_DEVICE_ID="$CUDA_VISIBLE_DEVICES"
 run_dir="/workspace/fm_dno/output/heading_goal/${run_name}"
 mkdir -p "$run_dir"
-/venv/oat/bin/python scripts/run_workspace.py \
+/venv/fm_dno/bin/python scripts/run_workspace.py \
   --config-name="$config_name" \
   hydra.run.dir="$run_dir" "$@" 2>&1 | tee -a "$run_dir/console.log"

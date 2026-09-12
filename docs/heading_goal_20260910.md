@@ -85,7 +85,7 @@ checkpoint. A standard 500-episode report may additionally be produced for that
 same checkpoint; it must disclose overlap with the development pilot states.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/workspace/fm_dno /venv/oat/bin/python \
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/workspace/fm_dno /venv/fm_dno/bin/python \
   scripts/eval_heading_policy.py -c CHECKPOINT -o NEW_OUTPUT_DIRECTORY \
   --n-per-task 10 --init-start 0 --seed 20260910 --workers 4
 ```

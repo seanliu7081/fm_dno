@@ -88,15 +88,17 @@ and EGL libraries.
 git clone --recursive https://github.com/seanliu7081/fm_dno.git
 cd fm_dno
 git submodule update --init --recursive
-uv sync
-source .venv/bin/activate
+source /opt/miniforge3/etc/profile.d/conda.sh
+conda activate fm_dno
 export PYTHONPATH="$PWD"
 python -c "import torch, oat, libero; print(torch.__version__, torch.cuda.is_available())"
 ```
 
 For an existing environment, install both packages with
 `pip install -e third_party/LIBERO` and `pip install -e .`.
-On the current workspace instance the prepared environment is `/venv/oat`.
+On the current workspace instance the prepared Conda environment is `fm_dno` at
+`/venv/fm_dno`. On a fresh machine with Conda installed, run `./setup_env.sh`
+to create it before activation.
 
 Before simulator evaluation:
 
@@ -107,6 +109,12 @@ python -c "from libero.libero import get_libero_path; print(get_libero_path('bdd
 ```
 
 The printed LIBERO paths must point to installed task assets and saved initial states.
+
+## MimicGen multi-task DiT training
+
+See [the six-task training guide](docs/mimicgen6_training.md) for the 100-demo-per-task
+Zarr split, delta actions, 50 held-out rollouts per task, and two-GPU heading-zero /
+heading-Gaussian DiT runs with inline evaluation every 50 epochs through epoch 600.
 
 ## Dataset
 
