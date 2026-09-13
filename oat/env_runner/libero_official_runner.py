@@ -85,12 +85,21 @@ class LiberoOfficialRunner(BaseRunner):
                              settle_steps=settle_steps, video_per_task=video_per_task)
         self.eval_gpu = eval_gpu
         self.torch_threads = torch_threads
+        self._media_artifacts = {}
 
     def run(self, policy, **kwargs):
         raise RuntimeError("use run_checkpoint(policy, cfg, epoch, global_step) to fix the evaluation context")
 
     def close(self):
         pass
+
+    def media_artifacts(self):
+        """Video paths from the most recent fully verified result, including reuse.
+
+        Keep media outside numeric metrics and runner_verified.json: W&B objects
+        belong to the training process, after all evaluation evidence is checked.
+        """
+        return dict(self._media_artifacts)
 
     @staticmethod
     def _inference_config(cfg):
@@ -210,6 +219,20 @@ class LiberoOfficialRunner(BaseRunner):
             _require(summary.get(key) == expected, f"evaluation summary mismatch: {key}")
         _require(summary.get("checkpoint_sha256") == digest and summary.get("weights") == evidence["weights"]
                  and not summary.get("checkpoint_integrity_error"), "summary checkpoint integrity mismatch")
+        media = {}
+        by_id = {row["episode_id"]: row for row in results}
+        for entry in plan:
+            if "video_path" not in entry:
+                continue
+            path = Path(entry["video_path"])
+            _ordinary_path(path)
+            row = by_id[entry["episode_id"]]
+            _require(row.get("video_path") == str(path), "episode video path differs from plan")
+            _require(isinstance(row.get("video_frames"), int) and row["video_frames"] > 0,
+                     "selected evaluation video contains no frames")
+            _require(path.is_file() and path.stat().st_size > 0, f"missing evaluation video: {path}")
+            media[f"eval/video/{entry['task_name']}/init_{entry['init_index']:03d}"] = str(path)
+        self._media_artifacts = media
         return {"mean_success_rate": float(computed["mean_success_rate"]),
                 "eval/successes": int(computed["successes"]),
                 "eval/episodes": int(computed["completed_episodes"]),
@@ -218,6 +241,7 @@ class LiberoOfficialRunner(BaseRunner):
                    for name, value in computed["per_task"].items()}}
 
     def run_checkpoint(self, policy, cfg, epoch, global_step):
+        self._media_artifacts = {}
         if int(epoch) != epoch or int(global_step) != global_step or min(epoch, global_step) < 0:
             raise ValueError("epoch and global_step must be nonnegative integers")
         rollout_root = Path(self.output_dir).absolute() / "rollouts"

@@ -9,6 +9,9 @@ if __name__ == "__main__":
 
 import os
 import random
+import json
+import time
+import dill
 import warnings
 import numpy as np
 from collections.abc import Mapping
@@ -67,6 +70,55 @@ def _epoch_events(epoch, training, *, lazy_eval, save_rollout_checkpoint=False,
         or (save_final_checkpoint and epoch + 1 == training.num_epochs)
     )
     return rollout_due, checkpoint_due
+
+
+def _periodic_epoch_due(epoch, every, offset=0):
+    if offset not in (0, 1) or int(every) < 1:
+        raise ValueError("Epoch offset must be 0 or 1 and interval must be positive")
+    return (epoch + offset) % int(every) == 0
+
+
+def _accumulate_training_metrics(accumulator, metrics):
+    """Store only detached scalar sums; no device synchronization or collective."""
+    if not isinstance(metrics, Mapping):
+        raise ValueError("Training metrics must map names to numerator/count pairs")
+    for name, pair in metrics.items():
+        if not isinstance(name, str) or len(pair) != 2:
+            raise ValueError("Invalid training metric name or numerator/count pair")
+        numerator, count = pair
+        if not all(isinstance(value, torch.Tensor) and value.numel() == 1 for value in pair):
+            raise ValueError(f"Training metric {name} must contain two scalar tensors")
+        value = torch.stack((numerator.detach().float().reshape(()),
+                             count.detach().float().reshape(())))
+        if name in accumulator:
+            accumulator[name].add_(value)
+        else:
+            accumulator[name] = value.clone()
+
+
+def _flush_training_metrics(accumulator, accelerator):
+    """Reduce sums once per flush so uneven valid-segment counts stay weighted."""
+    if not accumulator:
+        return {}
+    names = sorted(accumulator)
+    values = accelerator.reduce(torch.stack([accumulator[name] for name in names]), reduction='sum')
+    accumulator.clear()
+    # All ranks flush together, but only the writer needs to copy values to CPU.
+    if not accelerator.is_main_process:
+        return {}
+    values = values.cpu()
+    if not torch.isfinite(values).all() or (values[:, 1] < 0).any():
+        raise ValueError("Training metric sums/counts must be finite and counts nonnegative")
+    return {f'train/{name}': float(value[0] / value[1])
+            for name, value in zip(names, values) if value[1] > 0}
+
+
+def _rollout_media(env_runner, enabled):
+    accessor = getattr(env_runner, 'media_artifacts', None)
+    if not enabled or not callable(accessor):
+        return {}
+    import wandb
+    return {key: wandb.Video(path, format='mp4') for key, path in accessor().items()}
 
 
 def _merge_rollout_logs(rank_logs):
@@ -238,6 +290,7 @@ class TrainPolicyWorkspace(BaseWorkspace):
         'global_step', 'epoch', 'resume_state_version', 'next_epoch',
         'next_global_step', 'optimizer_step', 'ema_state',
         'lr_scheduler_state', 'lr_scheduler_config', 'rng_state',
+        'pending_rollout', 'topk_state',
     ]
 
     def __init__(self, cfg: OmegaConf, output_dir=None, lazy_instantiation=True):
@@ -273,6 +326,8 @@ class TrainPolicyWorkspace(BaseWorkspace):
         self.lr_scheduler_state = None
         self.lr_scheduler_config = None
         self.rng_state = None
+        self.pending_rollout = None
+        self.topk_state = {}
 
     def _resume_training_progress(self, payload, *, legacy_epoch_complete=False):
         """Advance completed training snapshots without changing logged epoch IDs.
@@ -283,6 +338,11 @@ class TrainPolicyWorkspace(BaseWorkspace):
         """
         modern = 'resume_state_version' in payload.get('pickles', {})
         if modern:
+            if self.pending_rollout is not None:
+                # Repeat only the unfinished epoch tail, with the frozen weights.
+                self.epoch = int(self.pending_rollout['epoch'])
+                self.global_step = int(self.pending_rollout['global_step'])
+                return
             if self.next_epoch is not None:
                 self.epoch = int(self.next_epoch)
                 self.global_step = int(self.next_global_step)
@@ -379,6 +439,43 @@ class TrainPolicyWorkspace(BaseWorkspace):
         if accelerator.device.type == 'cuda' and 'cuda' in state:
             torch.cuda.set_rng_state(state['cuda'].cpu(), accelerator.device)
 
+    @contextmanager
+    def _unwrapped_for_checkpoint(self, accelerator):
+        model, ema_model = self.model, self.ema_model
+        self.model = accelerator.unwrap_model(model)
+        if ema_model is not None:
+            self.ema_model = accelerator.unwrap_model(ema_model)
+        try:
+            yield
+        finally:
+            self.model, self.ema_model = model, ema_model
+
+    def _save_atomic_checkpoint(self, path=None):
+        """Recovery boundaries cannot expose a partially overwritten latest file."""
+        if self._saving_thread is not None:
+            self._saving_thread.join()
+        path = self.get_checkpoint_path() if path is None else pathlib.Path(path)
+        temporary = path.with_name(path.name + '.pending')
+        self.save_checkpoint(path=temporary, use_thread=False)
+        os.replace(temporary, path)
+
+    def _verify_existing_archive(self, path):
+        """A crash after archive creation may replay this exact boundary once."""
+        payload = torch.load(path, map_location='cpu', pickle_module=dill)
+        for key in ('epoch', 'global_step'):
+            if dill.loads(payload['pickles'][key]) != getattr(self, key):
+                raise RuntimeError(f"Conflicting rollout archive position: {path}")
+        for name in ('model', 'ema_model'):
+            model = getattr(self, name)
+            if model is None:
+                continue
+            saved, current = payload['state_dicts'][name], model.state_dict()
+            if saved.keys() != current.keys() or any(
+                    saved[key].dtype != value.dtype or saved[key].shape != value.shape
+                    or not torch.equal(saved[key], value.detach().cpu())
+                    for key, value in current.items()):
+                raise RuntimeError(f"Conflicting rollout archive weights: {path}")
+
     def run(self):
         cfg = copy.deepcopy(self.cfg)
 
@@ -436,6 +533,14 @@ class TrainPolicyWorkspace(BaseWorkspace):
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
         _configure_models_from_dataset(dataset, self.model, self.ema_model)
+        if accelerator.is_main_process:
+            metadata = getattr(dataset, 'get_training_metadata', None)
+            if callable(metadata):
+                metadata_path = pathlib.Path(self.output_dir) / 'training_dataset.json'
+                content = metadata()
+                if metadata_path.exists() and json.loads(metadata_path.read_text()) != content:
+                    raise RuntimeError('Training dataset provenance changed in the existing run directory')
+                metadata_path.write_text(json.dumps(content, indent=2, sort_keys=True) + '\n')
 
         # configure checkpoint
         if accelerator.is_main_process:
@@ -465,10 +570,13 @@ class TrainPolicyWorkspace(BaseWorkspace):
                 accelerator.print(f"Resuming from checkpoint {latest_ckpt_path}")
                 payload = self.load_checkpoint(path=latest_ckpt_path)
                 self._resume_training_progress(payload, legacy_epoch_complete=True)
-                if self.epoch >= cfg.training.num_epochs:
+                if self.epoch >= cfg.training.num_epochs and self.pending_rollout is None:
                     accelerator.print(f"Already trained for {self.epoch} epochs. Exiting.")
                     return
                 
+        if accelerator.is_main_process:
+            topk_manager.path_value_map = dict(self.topk_state)
+
         # Auxiliary artifacts may already be embedded in a resumed checkpoint.
         # Initialize them only after resume, and before DDP/EMA see module topology.
         self.model.prepare_for_training()
@@ -519,15 +627,31 @@ class TrainPolicyWorkspace(BaseWorkspace):
                 if callable(define_metric):
                     define_metric('global_step')
                     define_metric('*', step_metric='global_step')
-                    define_metric('action_mse/completed_epochs')
-                    define_metric('val/*', step_metric='action_mse/completed_epochs')
-                    define_metric('test_reconst_mse', step_metric='action_mse/completed_epochs')
+                    define_metric('optimizer_step')
+                    define_metric('train/*', step_metric='optimizer_step')
+                    define_metric('completed_epochs')
+                    define_metric('val_loss', step_metric='completed_epochs')
+                    define_metric('eval/completed_epochs')
+                    define_metric('eval/*', step_metric='eval/completed_epochs')
+                    define_metric('mean_success_rate', step_metric='eval/completed_epochs')
+                    reconstruction_axis = 'completed_epochs'
+                    if action_mse_dataset is not None:
+                        define_metric('action_mse/completed_epochs')
+                        define_metric('val/*', step_metric='action_mse/completed_epochs')
+                        reconstruction_axis = 'action_mse/completed_epochs'
+                    define_metric('test_reconst_mse', step_metric=reconstruction_axis)
                 wandb_run.config.update({'wandb_step_offset': wandb_step_offset}, allow_val_change=True)
 
         # Restore after construction, device preparation, and tracker setup,
         # which can consume RNG draws unrelated to the continuation.
         self._restore_training_rng(accelerator)
 
+        metrics_options = cfg.get('metrics')
+        metrics_every = int(metrics_options.get('train_every_updates', 50)) if metrics_options else None
+        if metrics_every is not None and metrics_every < 1:
+            raise ValueError('metrics.train_every_updates must be positive')
+        log_eval_videos = bool(metrics_options and metrics_options.get('log_eval_videos', False))
+        pop_metrics = getattr(accelerator.unwrap_model(self.model), 'pop_training_metrics', None)
         # training loop
         first_run_epoch = self.epoch
         log_path = os.path.join(self.output_dir, 'logs.json') if accelerator.is_main_process else None
@@ -537,86 +661,130 @@ class TrainPolicyWorkspace(BaseWorkspace):
                 if accelerator.is_main_process:
                     step_log = dict()
 
-                # model to train mode
-                self.model.train()
-                if cfg.training.use_ema:
-                    self.ema_model.train()
+                recovering_rollout = self.pending_rollout is not None
+                if recovering_rollout:
+                    if (int(self.pending_rollout['epoch']) != self.epoch
+                            or int(self.pending_rollout['global_step']) != self.global_step):
+                        raise RuntimeError('Pending evaluation disagrees with restored training position')
+                    if accelerator.is_main_process:
+                        step_log = dict(self.pending_rollout.get('step_log', {}))
+                    accelerator.print(f"Completing pending evaluation after epoch {self.epoch + 1}")
+                else:
+                    epoch_started = time.monotonic()
+                    metric_accumulator = {}
+                    # model to train mode
+                    self.model.train()
+                    if cfg.training.use_ema:
+                        self.ema_model.train()
 
-                loss_info = torch.zeros(2, device=device)   # [total loss, total batch_size]
-                with tqdm.tqdm(
-                    train_dataloader, 
-                    desc=f"Training epoch {self.epoch}",
-                    leave=False, 
-                    disable=not accelerator.is_local_main_process,
-                    mininterval=cfg.training.tqdm_interval_sec
-                ) as tepoch:
+                    loss_info = torch.zeros(2, device=device)   # [total loss, total batch_size]
+                    with tqdm.tqdm(
+                        train_dataloader,
+                        desc=f"Training epoch {self.epoch}",
+                        leave=False,
+                        disable=not accelerator.is_local_main_process,
+                        mininterval=cfg.training.tqdm_interval_sec
+                    ) as tepoch:
 
-                    for batch_idx, batch in enumerate(tepoch):
-                        with accelerator.accumulate(self.model):
-                            # device transfer
-                            batch = dict_apply(batch, lambda x: maybe_to_device(x, device))
+                        for batch_idx, batch in enumerate(tepoch):
+                            with accelerator.accumulate(self.model):
+                                # device transfer
+                                batch = dict_apply(batch, lambda x: maybe_to_device(x, device))
 
-                            # forward pass
-                            with accelerator.autocast():
-                                loss = self.model(batch)
+                                # forward pass
+                                with accelerator.autocast():
+                                    loss = self.model(batch)
 
-                            # backward pass
-                            accelerator.backward(loss)
+                                if callable(pop_metrics):
+                                    batch_metrics = pop_metrics()
+                                    if metrics_every is not None:
+                                        _accumulate_training_metrics(metric_accumulator, batch_metrics)
+                                if metrics_every is not None:
+                                    _accumulate_training_metrics(metric_accumulator, {
+                                        'total_loss': (loss.detach() * batch['action'].shape[0],
+                                                       loss.new_tensor(batch['action'].shape[0]))})
 
-                            # log loss
-                            batch_size = batch['action'].shape[0]
-                            loss_info[0] += loss.detach() * batch_size
-                            loss_info[1] += batch_size
+                                # backward pass
+                                accelerator.backward(loss)
 
-                            # step optimizer
-                            if accelerator.sync_gradients:
-                                # clip grad norm
-                                if cfg.training.max_grad_norm is not None:
-                                    _clip_grad_norm(
-                                        accelerator, self.model, self.optimizer,
-                                        cfg.training.max_grad_norm
-                                    )
+                                # log loss
+                                batch_size = batch['action'].shape[0]
+                                loss_info[0] += loss.detach() * batch_size
+                                loss_info[1] += batch_size
+
+                                updated = False
+                                # step optimizer
+                                if accelerator.sync_gradients:
+                                    # clip grad norm
+                                    if cfg.training.max_grad_norm is not None:
+                                        _clip_grad_norm(
+                                            accelerator, self.model, self.optimizer,
+                                            cfg.training.max_grad_norm
+                                        )
                             
-                                self.optimizer.step()
-                                self.optimizer.zero_grad(set_to_none=True)
-                                if not getattr(self.optimizer, 'step_was_skipped', False):
-                                    self.optimizer_step += 1
-                                    lr_scheduler.step()
-                                    if cfg.training.use_ema:
-                                        ema.step(accelerator.unwrap_model(self.model))
+                                    self.optimizer.step()
+                                    self.optimizer.zero_grad(set_to_none=True)
+                                    if not getattr(self.optimizer, 'step_was_skipped', False):
+                                        self.optimizer_step += 1
+                                        updated = True
+                                        lr_scheduler.step()
+                                        if cfg.training.use_ema:
+                                            ema.step(accelerator.unwrap_model(self.model))
 
-                            # logging
-                            is_last_batch = (batch_idx == (len_train_dataloader-1))
-                            if accelerator.is_main_process:
-                                loss_cpu = loss.item()
-                                tepoch.set_postfix(loss=loss_cpu, refresh=False)
-                                step_log = {
-                                    'train_loss': loss_cpu,
-                                    'global_step': self.global_step,
-                                    'epoch': self.epoch,
-                                    'lr': lr_scheduler.get_last_lr()[0],
-                                }
+                                # logging
+                                is_last_batch = (batch_idx == (len_train_dataloader-1)
+                                                 or (cfg.training.max_train_steps is not None
+                                                     and batch_idx >= cfg.training.max_train_steps - 1))
+                                flush_metrics = (metrics_every is not None and updated
+                                                 and self.optimizer_step % metrics_every == 0)
+                                training_log = (_flush_training_metrics(metric_accumulator, accelerator)
+                                                if flush_metrics else {})
+                                if accelerator.is_main_process and (metrics_every is None or flush_metrics or is_last_batch):
+                                    step_log = {
+                                        'global_step': self.global_step,
+                                        'optimizer_step': self.optimizer_step,
+                                        'epoch': self.epoch,
+                                        'lr': lr_scheduler.get_last_lr()[0],
+                                        **training_log,
+                                    }
+                                    if metrics_every is None:
+                                        step_log['train_loss'] = loss.item()
+                                    elif 'train/total_loss' in training_log:
+                                        step_log['train_loss'] = training_log['train/total_loss']
+                                    if 'train_loss' in step_log:
+                                        tepoch.set_postfix(loss=step_log['train_loss'], refresh=False)
+                                    if metrics_every is not None:
+                                        for index, lr in enumerate(lr_scheduler.get_last_lr()):
+                                            step_log[f'train/lr_group_{index}'] = lr
+                                    if not is_last_batch:
+                                        accelerator.log(step_log, step=self.global_step + wandb_step_offset)
+                                        json_logger.log(step_log)
+
+                                # increment global step
                                 if not is_last_batch:
-                                    accelerator.log(step_log, step=self.global_step + wandb_step_offset)
-                                    json_logger.log(step_log)
+                                    self.global_step += 1
 
-                            # increment global step
-                            if not is_last_batch:
-                                self.global_step += 1
+                                # break if reach max training steps
+                                if (cfg.training.max_train_steps is not None) \
+                                    and batch_idx >= (cfg.training.max_train_steps-1):
+                                    break
 
-                            # break if reach max training steps
-                            if (cfg.training.max_train_steps is not None) \
-                                and batch_idx >= (cfg.training.max_train_steps-1):
-                                break
-
-                # at the end of each epoch
-                # replace train_loss with epoch average
-                accelerator.wait_for_everyone()
-                loss_info = accelerator.reduce(loss_info, reduction='sum')
-                accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    step_log['train_loss'] = (loss_info[0] / loss_info[1]).item()
-                    step_log['completed_epochs'] = self.epoch + 1
+                    # at the end of each epoch
+                    # replace train_loss with epoch average
+                    accelerator.wait_for_everyone()
+                    loss_info = accelerator.reduce(loss_info, reduction='sum')
+                    accelerator.wait_for_everyone()
+                    residual_metrics = _flush_training_metrics(metric_accumulator, accelerator)
+                    if accelerator.is_main_process:
+                        step_log.update(residual_metrics)
+                        step_log['epoch'] = self.epoch
+                        step_log['lr'] = lr_scheduler.get_last_lr()[0]
+                        step_log['global_step'] = self.global_step
+                        step_log['optimizer_step'] = self.optimizer_step
+                        step_log['train/epoch_duration_seconds'] = time.monotonic() - epoch_started
+                        step_log['train/examples_per_second'] = float(loss_info[1]) / step_log['train/epoch_duration_seconds']
+                        step_log['train_loss'] = (loss_info[0] / loss_info[1]).item()
+                        step_log['completed_epochs'] = self.epoch + 1
 
                 # ========= eval for this epoch ==========
                 policy = accelerator.unwrap_model(self.model)
@@ -629,9 +797,23 @@ class TrainPolicyWorkspace(BaseWorkspace):
                     save_rollout_checkpoint=cfg.checkpoint.get('save_rollout_ckpt', False),
                     save_final_checkpoint=cfg.checkpoint.get('save_final_ckpt', False),
                 )
+                if recovering_rollout and not rollout_due:
+                    raise RuntimeError('Pending rollout must retain its original evaluation schedule')
+                boundary_recovery = bool(cfg.checkpoint.get('save_before_rollout', False) or recovering_rollout)
+                if rollout_due and boundary_recovery and not recovering_rollout:
+                    self.pending_rollout = {'epoch': self.epoch, 'global_step': self.global_step,
+                                            'step_log': dict(step_log) if accelerator.is_main_process else {}}
+                    self._capture_training_state(ema, lr_scheduler, accelerator)
+                    if accelerator.is_main_process:
+                        self.topk_state = dict(topk_manager.path_value_map)
+                        with self._unwrapped_for_checkpoint(accelerator):
+                            self._save_atomic_checkpoint()
+                    accelerator.wait_for_everyone()
+                rollout_media = {}
                 # A checkpoint-aware runner isolates simulator RNG and returns
                 # metrics to this training run after a fixed-policy evaluation.
                 if rollout_due:
+                    rollout_started = time.monotonic()
                     accelerator.wait_for_everyone()
                     if distributed_eval:
                         runner_log = _run_distributed_rollout(
@@ -641,6 +823,8 @@ class TrainPolicyWorkspace(BaseWorkspace):
                         if accelerator.is_main_process:
                             step_log.update(runner_log)
                     elif accelerator.is_main_process:
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
                         run_checkpoint = getattr(env_runner, 'run_checkpoint', None)
                         if callable(run_checkpoint):
                             runner_log = run_checkpoint(
@@ -648,7 +832,10 @@ class TrainPolicyWorkspace(BaseWorkspace):
                         else:
                             runner_log = env_runner.run(policy)
                         step_log.update(runner_log)
+                        rollout_media = _rollout_media(env_runner, log_eval_videos)
                     accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        step_log['eval/duration_seconds'] = time.monotonic() - rollout_started
 
                 if action_mse_dataset is not None and _action_mse_due(
                         self.epoch, action_mse_options, first_epoch=first_run_epoch):
@@ -662,13 +849,14 @@ class TrainPolicyWorkspace(BaseWorkspace):
                         accelerator.print(f"Held-out action MSE: {action_mse_log['val/action_mse']:.6f}")
 
                 # run validation
-                if has_validation and (self.epoch % cfg.training.val_every) == 0:
+                if has_validation and _periodic_epoch_due(
+                        self.epoch, cfg.training.val_every, cfg.training.get('validation_epoch_offset', 0)):
                     loss_info = torch.zeros(2, device=device)   # [total loss, total batch_size]
                     with torch.inference_mode():
                         with tqdm.tqdm(
                             val_dataloader, 
                             desc=f"Validation epoch {self.epoch}",
-                            leave=False, 
+                            leave=False,
                             disable=not accelerator.is_local_main_process,
                             mininterval=cfg.training.tqdm_interval_sec
                         ) as tepoch:
@@ -678,7 +866,11 @@ class TrainPolicyWorkspace(BaseWorkspace):
                                 batch = dict_apply(batch, lambda x: maybe_to_device(x, device, non_blocking=True))
 
                                 # forward pass
-                                loss = policy(batch).item()
+                                with accelerator.autocast():
+                                    loss = policy(batch).detach()
+                                clear_metrics = getattr(policy, 'pop_training_metrics', None)
+                                if callable(clear_metrics):
+                                    clear_metrics()
 
                                 # log loss
                                 batch_size = batch['action'].shape[0]
@@ -698,13 +890,14 @@ class TrainPolicyWorkspace(BaseWorkspace):
                         step_log['val_loss'] = (loss_info[0] / loss_info[1]).item()
 
                 # action prediction eval
-                if has_validation and self.epoch % cfg.training.sample_every == 0:
+                if has_validation and _periodic_epoch_due(
+                        self.epoch, cfg.training.sample_every, cfg.training.get('sample_epoch_offset', 0)):
                     loss_info = torch.zeros(2, device=device)   # [total loss, total batch_size]
                     with torch.inference_mode():
                         with tqdm.tqdm(
                             val_dataloader, 
                             desc=f"Reconstruction epoch {self.epoch}",
-                            leave=False, 
+                            leave=False,
                             disable=not accelerator.is_local_main_process,
                             mininterval=cfg.training.tqdm_interval_sec
                         ) as tepoch:
@@ -737,53 +930,46 @@ class TrainPolicyWorkspace(BaseWorkspace):
                     if accelerator.is_main_process:
                         step_log['test_reconst_mse'] = (loss_info[0] / loss_info[1]).item()
 
-                # Every rank contributes its RNG state before the main rank saves.
+                # Write verified metrics before completing the recovery boundary.
+                if accelerator.is_main_process:
+                    accelerator.log({**step_log, **rollout_media}, step=self.global_step + wandb_step_offset)
+                    json_logger.log(step_log)
+
+                checkpoint_due = checkpoint_due or (rollout_due and boundary_recovery)
                 if checkpoint_due:
                     self._capture_training_state(ema, lr_scheduler, accelerator)
-
-                # checkpoint
                 if accelerator.is_main_process and checkpoint_due:
-                    # unwrap
-                    model_ddp = self.model
-                    self.model = accelerator.unwrap_model(self.model)
-                    if cfg.training.use_ema:
-                        ema_model_ddp = self.ema_model
-                        self.ema_model = accelerator.unwrap_model(self.ema_model)
-
-                    # checkpointing
-                    if cfg.checkpoint.save_last_ckpt:
-                        self.save_checkpoint()
-                    if cfg.checkpoint.save_last_snapshot:
-                        self.save_snapshot()
-                    if rollout_due and cfg.checkpoint.get('save_rollout_ckpt', False):
-                        archive = pathlib.Path(self.output_dir) / 'checkpoints' / f'epoch-{self.epoch + 1:04d}.ckpt'
-                        if archive.exists():
-                            raise FileExistsError(f"Refusing to overwrite rollout checkpoint: {archive}")
-                        self.save_checkpoint(path=archive, use_thread=False)
-
-                    # sanitize metric names
-                    metric_dict = dict()
-                    for key, value in step_log.items():
-                        new_key = key.replace('/', '_')
-                        metric_dict[new_key] = value
-
-                    # We can't copy the last checkpoint here
-                    # since save_checkpoint uses threads.
-                    # therefore at this point the file might have been empty!
+                    metric_dict = {key.replace('/', '_'): value for key, value in step_log.items()}
                     topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
-                    if topk_ckpt_path is not None:
-                        self.save_checkpoint(path=topk_ckpt_path)
-
-                    # restore
-                    self.model = model_ddp
-                    if cfg.training.use_ema:
-                        self.ema_model = ema_model_ddp
-
-                # end of epoch
-                # log of last step is combined with validation and rollout
-                if accelerator.is_main_process:
-                    accelerator.log(step_log, step=self.global_step + wandb_step_offset)
-                    json_logger.log(step_log)
+                    self.topk_state = dict(topk_manager.path_value_map)
+                    # latest remains marked pending until all selected artifacts
+                    # have been saved; a crash reuses the same official snapshot.
+                    self.pending_rollout = None
+                    with self._unwrapped_for_checkpoint(accelerator):
+                        synchronous = bool(rollout_due and boundary_recovery)
+                        if topk_ckpt_path is not None:
+                            if synchronous:
+                                self._save_atomic_checkpoint(topk_ckpt_path)
+                            else:
+                                self.save_checkpoint(path=topk_ckpt_path)
+                        if rollout_due and cfg.checkpoint.get('save_rollout_ckpt', False):
+                            archive = pathlib.Path(self.output_dir) / 'checkpoints' / f'epoch-{self.epoch + 1:04d}.ckpt'
+                            if archive.exists():
+                                if not recovering_rollout:
+                                    raise FileExistsError(f"Refusing to overwrite rollout checkpoint: {archive}")
+                                self._verify_existing_archive(archive)
+                            else:
+                                self._save_atomic_checkpoint(archive)
+                        if cfg.checkpoint.save_last_snapshot:
+                            self.save_snapshot()
+                        if cfg.checkpoint.save_last_ckpt or synchronous:
+                            if synchronous:
+                                self._save_atomic_checkpoint()
+                            else:
+                                self.save_checkpoint()
+                if rollout_due and boundary_recovery:
+                    self.pending_rollout = None
+                    accelerator.wait_for_everyone()
 
                 # increment epoch and global step
                 self.epoch += 1

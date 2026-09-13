@@ -1,0 +1,150 @@
+# Scratch spatial motion-query DiT: 500 epochs, online W&B, 50-epoch LIBERO rollouts.
+defaults:
+- task/policy: libero/libero10_spatial_motion
+- _self_
+name: train_flowpolicy_spatial_motion_dit
+_target_: oat.workspace.train_policy.TrainPolicyWorkspace
+seed: 42
+horizon: 16
+n_action_steps: 8
+n_obs_steps: 2
+task_name: ${task.policy.name}
+shape_meta: ${task.policy.shape_meta}
+policy:
+  _target_: oat.policy.flow_policy_spatial_motion.SpatialMotionFlowPolicy
+  shape_meta: ${shape_meta}
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  obs_encoder:
+    _target_: oat.perception.spatial_token_encoder.SpatialTokenObservationEncoder
+    shape_meta: ${shape_meta}
+    n_obs_steps: ${n_obs_steps}
+    crop_shape:
+    - 116
+    - 116
+    token_dim: 256
+    task_ids:
+    - 30
+    - 31
+    - 32
+    - 33
+    - 34
+    - 35
+    - 36
+    - 37
+    - 38
+    - 39
+  backbone_type: starvla_dit
+  backbone_kwargs:
+    num_register_tokens: 32
+    add_cond_pos_emb: false
+  embed_dim: 256
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.0
+  num_inference_steps: 10
+  inference_bf16: true
+  prior_noise_scale: 1.0
+  num_motion_segments: 4
+  motion_decoder_layers: 2
+  motion_decoder_heads: 4
+  motion_decoder_ff_dim: 1024
+  heading_loss_weight: 0.1
+  validity_loss_weight: 0.1
+  min_target_confidence: 0.05
+  min_source_confidence: 0.5
+  prior_heading_mean: 0.5
+  prior_parallel_std: 1.0
+  prior_perpendicular_std: 0.5
+training:
+  resume: false
+  allow_bf16: true
+  max_grad_norm: 1.0
+  num_epochs: 500
+  val_every: 10
+  sample_every: 50
+  rollout_every: 50
+  checkpoint_every: 1
+  lr_scheduler: constant_with_warmup
+  lr_warmup_steps: 500
+  gradient_accumulate_every: 1
+  max_train_steps: null
+  max_val_steps: null
+  max_reconst_steps: null
+  seed: ${seed}
+  use_ema: true
+  num_demo: 500
+  tqdm_interval_sec: 60.0
+  expected_num_processes: 1
+  rollout_epoch_offset: 1
+  validation_epoch_offset: 1
+  sample_epoch_offset: 1
+ema:
+  _target_: oat.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+optimizer:
+  policy_lr: 0.0001
+  obs_enc_lr: 0.0001
+  heading_lr: 0.0001
+  weight_decay: 1.0e-06
+  betas:
+  - 0.9
+  - 0.999
+dataloader:
+  batch_size: 64
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+val_dataloader:
+  batch_size: 64
+  num_workers: 2
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+  drop_last: false
+logging:
+  project: oat_dev
+  resume: false
+  mode: online
+  name: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_seed${seed}
+  tags:
+  - libero10
+  - spatial_tokens
+  - motion_queries
+  - dit
+  - scratch
+  - 500epochs
+  id: null
+  group: libero10_spatial_motion_dit_500ep
+checkpoint:
+  topk:
+    monitor_key: mean_success_rate
+    mode: max
+    k: 1
+    format_str: ep-{completed_epochs:04d}_success-{mean_success_rate:.4f}.ckpt
+  save_last_ckpt: true
+  save_last_snapshot: false
+  save_rollout_ckpt: true
+  save_final_ckpt: true
+  save_before_rollout: true
+multi_run:
+  run_dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+  wandb_name_base: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_N${training.num_demo}
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: output/spatial_motion_dit/${now:%Y%m%dT%H%M%S}_seed${seed}
+  sweep:
+    dir: output/${now:%Y%m%d}/${now:%H%M%S}_${name}_${task_name}_N${training.num_demo}
+    subdir: ${hydra.job.num}
+metrics:
+  train_every_updates: 50
+  log_eval_videos: true

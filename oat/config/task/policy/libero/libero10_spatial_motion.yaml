@@ -1,0 +1,68 @@
+# Dedicated LIBERO-10 task with synchronous checkpoint evaluation.
+name: libero10
+task_name: libero10
+lazy_eval: false
+shape_meta:
+  obs:
+    agentview_rgb:
+      shape:
+      - 128
+      - 128
+      - 3
+      type: rgb
+    robot0_eye_in_hand_rgb:
+      shape:
+      - 128
+      - 128
+      - 3
+      type: rgb
+    robot0_eef_pos:
+      shape:
+      - 3
+      type: state
+    robot0_eef_quat:
+      shape:
+      - 4
+      type: state
+    robot0_gripper_qpos:
+      shape:
+      - 2
+      type: state
+    task_uid:
+      shape:
+      - 1
+      type: state
+  action:
+    shape:
+    - 7
+env_runner:
+  _target_: oat.env_runner.libero_official_runner.LiberoOfficialRunner
+  suite: libero_10
+  n_per_task: 50
+  init_start: 0
+  seed: 20260911
+  workers: 8
+  eval_gpu: 1
+  max_episode_steps: 550
+  settle_steps: 10
+  video_per_task: 1
+  torch_threads: 1
+dataset:
+  _target_: oat.dataset.motion_plan_zarr_dataset.MotionPlanZarrDataset
+  zarr_path: /home/haotian/code/oat/data/libero/libero10_N500.zarr
+  obs_keys:
+  - agentview_rgb
+  - robot0_eye_in_hand_rgb
+  - robot0_eef_pos
+  - robot0_eef_quat
+  - robot0_gripper_qpos
+  - task_uid
+  action_key: action
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${horizon}
+  seed: ${seed}
+  val_ratio: 0.1
+  rgb_keys:
+  - agentview_rgb
+  - robot0_eye_in_hand_rgb
+distributed_eval: false

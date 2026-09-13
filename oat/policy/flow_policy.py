@@ -139,7 +139,7 @@ class FlowPolicy(BasePolicy):
             f"  obs enc : {num_obs_params / 1e6:.1f}M "
             f"({num_trainable_obs / max(num_obs_params, 1):.5%} trainable)\n"
             f"  policy  : {num_model_params / 1e6:.1f}M\n"
-            f"  backbone={backbone_type}, cond_len={n_obs_steps}, flow_steps={num_inference_steps}, "
+            f"  backbone={backbone_type}, cond_len={getattr(model, 'cond_len', n_obs_steps)}, flow_steps={num_inference_steps}, "
             f"sigma={prior_noise_scale}\n"
         )
 

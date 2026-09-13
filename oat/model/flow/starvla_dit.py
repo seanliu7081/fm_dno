@@ -27,7 +27,7 @@ modulation. It is an action-head adaptation, with no VLM or layerwise features.
 """
 
 import math
-from typing import Union
+from typing import Optional, Union
 
 import torch
 from torch import nn
@@ -128,6 +128,8 @@ class StarVLAFlowTransformer(nn.Module):
         p_drop_emb: float = 0.1,
         p_drop_attn: float = 0.1,
         num_register_tokens: int = 32,
+        cond_len: Optional[int] = None,
+        add_cond_pos_emb: bool = True,
     ):
         super().__init__()
         for name, value in (
@@ -147,11 +149,16 @@ class StarVLAFlowTransformer(nn.Module):
         if not isinstance(num_register_tokens, int) or num_register_tokens < 0:
             raise ValueError("num_register_tokens must be a nonnegative integer")
 
+        if cond_len is not None and (not isinstance(cond_len, int) or cond_len < 1):
+            raise ValueError("cond_len must be a positive integer when specified")
+
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.horizon = horizon
         self.n_obs_steps = n_obs_steps
         self.cond_dim = cond_dim
+        self.cond_len = n_obs_steps if cond_len is None else cond_len
+        self.add_cond_pos_emb = add_cond_pos_emb
         self.n_emb = n_emb
 
         # Source action encoder: project actions, concatenate sinusoidal time,
@@ -161,10 +168,14 @@ class StarVLAFlowTransformer(nn.Module):
             nn.Linear(2 * n_emb, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb)
         )
         self.action_pos_emb = nn.Parameter(torch.empty(1, horizon, n_emb))
-        self.obs_pos_emb = nn.Parameter(torch.empty(1, n_obs_steps, cond_dim))
+        if add_cond_pos_emb:
+            self.obs_pos_emb = nn.Parameter(torch.empty(1, self.cond_len, cond_dim))
+        else:
+            self.register_parameter("obs_pos_emb", None)
         self.register_tokens = nn.Parameter(torch.empty(1, num_register_tokens, n_emb))
         nn.init.normal_(self.action_pos_emb, std=0.02)
-        nn.init.normal_(self.obs_pos_emb, std=0.02)
+        if self.obs_pos_emb is not None:
+            nn.init.normal_(self.obs_pos_emb, std=0.02)
         nn.init.normal_(self.register_tokens, std=0.02)
         self.embedding_dropout = nn.Dropout(p_drop_emb)
 
@@ -193,9 +204,9 @@ class StarVLAFlowTransformer(nn.Module):
         batch_size, horizon, _ = sample.shape
         if not 0 < horizon <= self.horizon:
             raise ValueError(f"sample horizon must be between 1 and {self.horizon}")
-        if cond.shape != (batch_size, self.n_obs_steps, self.cond_dim):
+        if cond.shape != (batch_size, self.cond_len, self.cond_dim):
             raise ValueError(
-                f"cond must have shape (B, {self.n_obs_steps}, {self.cond_dim})"
+                f"cond must have shape (B, {self.cond_len}, {self.cond_dim})"
             )
         timesteps = torch.as_tensor(timestep, device=sample.device)
         if timesteps.ndim == 0:
@@ -217,7 +228,8 @@ class StarVLAFlowTransformer(nn.Module):
             timesteps, 256, flip_sin_to_cos=True, frequency_shift=1
         ).to(self.time_encoder[0].weight.dtype)
         time_embedding = self.time_encoder(time_features)
-        cond = cond + self.obs_pos_emb.to(cond.dtype)
+        if self.obs_pos_emb is not None:
+            cond = cond + self.obs_pos_emb.to(cond.dtype)
         for block in self.blocks:
             hidden = block(hidden, time_embedding, cond)
 
