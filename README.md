@@ -110,6 +110,13 @@ python -c "from libero.libero import get_libero_path; print(get_libero_path('bdd
 
 The printed LIBERO paths must point to installed task assets and saved initial states.
 
+## QwenVL + StarVLA Heading Gaussian
+
+The [QwenVL training guide](docs/starvla_heading_gaussian.md) describes the native
+StarVLA DiT Heading Gaussian expert, full Qwen2.5-VL-3B fine-tuning on six GPUs,
+original LIBERO four-suite training, and strict zero-shot LIBERO-Plus evaluation.
+This uses natural-language instructions and a separate VLA training pipeline.
+
 ## MimicGen multi-task DiT training
 
 See [the six-task training guide](docs/mimicgen6_training.md) for the 100-demo-per-task

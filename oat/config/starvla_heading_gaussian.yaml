@@ -1,0 +1,70 @@
+variant: heading_gaussian
+seed: 42
+seeds: [42, 43, 44]
+output_dir: /workspace/fm_dno/output/starvla_heading_gaussian/seed42
+
+dataset:
+  manifest: /workspace/fm_dno/artifacts/starvla_heading/libero_manifest.json
+
+framework:
+  name: QwenHeadingGaussian
+  n_obs_steps: 2
+  execution_horizon: 8
+  image_size: 224
+  max_input_tokens: 512
+  qwenvl:
+    base_vlm: /workspace/models/Qwen2.5-VL-3B-Instruct
+    attn_implementation: sdpa
+  action_model:
+    action_model_type: DiT-B
+    hidden_size: 1024
+    n_obs_steps: 2
+    state_dim: 9
+    action_dim: 7
+    action_horizon: 16
+    num_inference_timesteps: 10
+    prior_heading_mean: 0.5
+    prior_parallel_std: 1.0
+    prior_perpendicular_std: 0.5
+    prior_noise_scale: 1.0
+    min_source_confidence: 0.5
+    min_target_confidence: 0.05
+    heading_loss_weight: 0.1
+    validity_loss_weight: 0.1
+    diffusion_model_cfg:
+      num_layers: 16
+      dropout: 0.0
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      output_dim: 1024
+      positional_embeddings: null
+
+training:
+  full_finetuning: true
+  gradient_audit_steps: [1]
+  world_size: 6
+  micro_batch_size: 10
+  gradient_accumulation_steps: 1
+  max_steps: 30000
+  num_workers: 2
+  gradient_clipping: 1.0
+  checkpoint_interval: 1000
+  log_interval: 10
+  minimum_free_disk_gib: 75
+  optimizer:
+    qwen_lr: 1.0e-5
+    vision_lr: 5.0e-6
+    expert_lr: 1.0e-4
+    weight_decay: 1.0e-6
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    warmup_steps: 500
+
+validation:
+  benchmark: libero
+  metric: normalized_action_mse
+  num_samples: 600
+  micro_batch_size: 10
+  interval: 1000
+  seed: 1729

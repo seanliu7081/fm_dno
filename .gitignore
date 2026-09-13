@@ -6,3 +6,6 @@ output/
 
 third_party/mimicgen/
 third_party/robosuite-task-zoo/
+
+# Runtime evaluation artifacts (training artifacts already use output/).
+outputs/
