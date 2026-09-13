@@ -645,7 +645,7 @@ bash scripts/run_spatial_motion_dit.sh --run-dir output/spatial_motion_dit/NEW_R
 
 The wrapper defaults to training GPU 0, evaluation GPU 1, and the verified `oat` Python environment. It captures the resolved configuration, code, environment versions, and hardware. For interruption recovery, use `bash scripts/run_spatial_motion_dit.sh --resume output/spatial_motion_dit/EXISTING_RUN_DIRECTORY`; this reuses the saved configuration and W&B ID. Resume only after confirming that the existing trainer has stopped.
 
-If two-GPU training is selected later, preserve global batch size and audit Accelerate's loader sharding and scheduler accounting before launch. It is not required for the first implementation. The first full training epoch took approximately 106 seconds, suggesting roughly 15 hours for training alone. The ten scheduled evaluations add time; their duration is not yet measured.
+If two-GPU training is selected later, preserve global batch size and audit Accelerate's loader sharding and scheduler accounting before launch. It is not required for the first implementation. The first full training epoch took approximately 106 seconds, suggesting roughly 15 hours for training alone. The epoch-50 benchmark took 495.27 seconds (8.25 minutes); the ten scheduled evaluations add time, with duration depending on episode length.
 
 ## 16. Implementation sequence
 
@@ -708,6 +708,8 @@ The first run establishes the new design's performance. It does not by itself is
 Implementation steps 1–7 are complete. The full training/evaluation run and final result verification remain in progress.
 
 The implemented model has 29,226,634 trainable parameters. A real batch of 64 passed the forward/backward, finite-gradient, optimizer-coverage, and strict checkpoint-reload checks; peak allocated GPU memory in that check was approximately 2.22 GB. A short checkpoint-based simulator execution check completed one episode for each of ten tasks with eight workers and no simulator or video errors. Its untrained, eight-action episodes are execution checks and do not count toward benchmark results.
+
+The first scheduled benchmark, after 50 full epochs and 97,150 optimizer updates, achieved **87.8% success (439/500)**. Independent verification confirmed 500 unique episodes, 50 initial states per task, zero simulator/video errors, and all ten selected videos. The saved best training checkpoint exactly matches the evaluated EMA weights. W&B received the score and all ten videos. Training continued into epoch 51; the remaining nine scheduled evaluations and full 500-epoch completion are still pending. Detailed evidence is in `epoch_0050_boundary_audit.json`, `epoch_0050_independent_verification.json`, and the generated result report in the run directory.
 
 The live scratch run started on 2026-09-13 at 20:08 UTC:
 
