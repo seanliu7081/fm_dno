@@ -104,10 +104,13 @@ def evaluation_command(benchmark, output, server_url, training_manifest, workers
             "--trials", "50" if benchmark == "libero" else "1"]
 
 
-def server_command(checkpoint, port=18080, device="cuda:0"):
-    return [TRAIN_PYTHON, str(ROOT / "scripts/serve_starvla_heading.py"), "--checkpoint",
+def server_command(checkpoint, port=18080, device="cuda:0", devices=None):
+    command = [TRAIN_PYTHON, str(ROOT / "scripts/serve_starvla_heading.py"), "--checkpoint",
             str(Path(checkpoint).resolve(strict=True)), "--host", "127.0.0.1", "--port", str(port),
             "--device", device, "--max-batch-size", "4"]
+    if devices:
+        command += ["--devices", *devices]
+    return command
 
 
 def verify_completed_training(output, expected_config):
@@ -460,7 +463,13 @@ class Experiment:
                 if probe.connect_ex(("127.0.0.1", self.args.server_port)) == 0:
                     raise RuntimeError(f"Port {self.args.server_port} is occupied; refusing to adopt another server")
             try:
-                server = self.start(server_command(info["checkpoint"], self.args.server_port, self.args.server_device), "server", output / "inference.log")
+                devices = getattr(self.args, "inference_devices", None)
+                workers = getattr(self.args, "parallel_eval_workers", None) or self.args.eval_workers
+                self.event("evaluation_execution", seed=seed,
+                           inference_devices=devices or [self.args.server_device],
+                           workers=workers, render_device=self.args.render_gpu_device_id)
+                server = self.start(server_command(info["checkpoint"], self.args.server_port,
+                                    self.args.server_device, devices), "server", output / "inference.log")
                 self.wait_for_server(server, info)
                 write_json(output / "evaluation/checkpoint_verified.json", {**info,
                     "verification": "owned_inference_server_loaded_checkpoint", "verified_at_unix": time.time()})
@@ -471,7 +480,7 @@ class Experiment:
                     destination = output / "evaluation" / benchmark
                     self.run_command(evaluation_command(
                         benchmark, destination, self.server_url, Path(info["checkpoint"]) / "dataset_manifest.json",
-                        self.args.eval_workers, self.args.render_gpu_device_id),
+                        workers, self.args.render_gpu_device_id),
                         "evaluation", output / f"evaluation_{benchmark}.log")
                     reports[benchmark] = verify_evaluation(destination, benchmark, info)
                     if reports[benchmark] is None:
@@ -538,6 +547,12 @@ def main(argv=None):
     parser.add_argument("--server-device", default="cuda:0", help="Inference GPU after six-GPU training has exited")
     parser.add_argument("--render-gpu-device-id", type=int, default=1, help="EGL device used after training has exited")
     parser.add_argument("--eval-workers", type=int, default=4)
+    # Execution concurrency is logged separately from the frozen scientific
+    # configuration. Episode inputs, metadata and resume manifests stay intact.
+    parser.add_argument("--inference-devices", nargs="+",
+                        help="Policy replicas used only after training exits")
+    parser.add_argument("--parallel-eval-workers", type=int,
+                        help="Override simulator concurrency without changing episode manifests")
     parser.add_argument("--prune-completed-optimizer", action="store_true",
                         help="After both verified full evaluations, delete generated optimizer state and an unselected latest export")
     args = parser.parse_args(argv)
@@ -549,6 +564,13 @@ def main(argv=None):
         parser.error("Invalid server port or startup timeout")
     if not re.fullmatch(r"cuda:\d+", args.server_device) or args.render_gpu_device_id < 0 or args.eval_workers < 1:
         parser.error("Expected --server-device cuda:N, a nonnegative render GPU, and positive eval workers")
+    if args.parallel_eval_workers is not None and args.parallel_eval_workers < 1:
+        parser.error("--parallel-eval-workers must be positive")
+    if args.inference_devices:
+        if (len(set(args.inference_devices)) != len(args.inference_devices)
+                or any(not re.fullmatch(r"cuda:\d+", device) for device in args.inference_devices)
+                or f"cuda:{args.render_gpu_device_id}" in args.inference_devices):
+            parser.error("Inference devices must be distinct CUDA devices separate from rendering")
     return Experiment(args, config).run()
 
 

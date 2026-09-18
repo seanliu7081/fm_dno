@@ -409,6 +409,10 @@ def initialize_worker(settings):
     os.environ.setdefault("MUJOCO_GL", "egl")
     import torch
     torch.set_num_threads(1)
+    from .rendering import configure_robosuite_egl, install_robosuite_egl_cleanup
+    mapping = configure_robosuite_egl(settings["render_gpu_device_id"])
+    install_robosuite_egl_cleanup()
+    print(json.dumps({"event": "renderer_device_verified", **mapping}), flush=True)
     _WORKER_CLIENT = None if settings["smoke"] else PolicyClient(settings["server_url"], settings["policy"])
 
 

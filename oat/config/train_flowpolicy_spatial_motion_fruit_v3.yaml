@@ -1,0 +1,51 @@
+# Keep the spatial-motion DiT architecture/optimizer; match fruit image geometry.
+defaults:
+  - train_flowpolicy_spatial_motion_dit
+  - override task/policy: real_robot/fruit_v3_spatial_motion
+  - _self_
+
+name: train_flowpolicy_spatial_motion_fruit_v3
+
+policy:
+  obs_encoder:
+    crop_shape: [112, 112]
+    task_ids: [0]
+    state_keys: [robot0_eef_pos, robot0_eef_rot6d, robot0_gripper_qpos]
+
+training:
+  num_demo: 40
+  # Match the current fruit policy script; override with POLICY_EPOCHS if needed.
+  num_epochs: 1001
+  resume: false
+  val_every: 1
+  sample_every: 1
+  max_reconst_steps: 10
+  validation_epoch_offset: 0
+  sample_epoch_offset: 0
+  checkpoint_every: 50
+  tqdm_interval_sec: 10.0
+
+val_dataloader:
+  batch_size: 32
+  drop_last: false
+
+logging:
+  project: real_robot
+  mode: online
+  resume: false
+  group: fruitV3_40_spatial_motion
+  tags: [real_robot, fruitV3_40, spatial_tokens, motion_queries, dit, scratch]
+
+checkpoint:
+  topk:
+    monitor_key: test_reconst_mse
+    mode: min
+    # Capacity exceeds the scheduled saves, retaining every scheduled checkpoint.
+    k: ${eval:'(${training.num_epochs} - 1) // ${training.checkpoint_every} + 2'}
+    format_str: 'ep-{epoch:04d}_mse-{test_reconst_mse:.6f}.ckpt'
+  save_rollout_ckpt: false
+  save_final_ckpt: true
+  save_before_rollout: false
+
+metrics:
+  log_eval_videos: false

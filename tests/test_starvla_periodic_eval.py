@@ -325,10 +325,11 @@ def test_unverified_partial_or_invalid_rate_events_are_never_published(tmp_path,
     assert not path.exists()
 
 
-def coordinator(tmp_path, config):
+def coordinator(tmp_path, config, **options):
     args = SimpleNamespace(output_root=tmp_path / "training", server_port=18087,
                            server_device="cuda:6", render_gpu_device_id=7, eval_workers=4,
                            poll_seconds=.000001, server_startup_timeout=10)
+    vars(args).update(options)
     result = periodic.PeriodicExperiment(args, {"config": config})
     result.output.mkdir(parents=True, exist_ok=True)
     return result
@@ -468,3 +469,88 @@ def test_summary_requires_all_nine_seed_milestone_pairs_and_keeps_seed_uncertain
     experiment.reports[44, 30000] = {"libero": report(.6), "libero_plus": report(.4)}
     experiment.update_summary()
     assert json.loads((experiment.output / "summary.json").read_text())["complete"]
+
+
+@pytest.mark.parametrize("value", ["42", "42:9999", "42:10000:20000", "-1:10000", "42:1e4"])
+def test_only_job_rejects_invalid_schedule_syntax(value):
+    with pytest.raises(periodic.argparse.ArgumentTypeError):
+        periodic.parse_job(value)
+
+
+def test_only_job_rejects_seed_outside_frozen_schedule(tmp_path, config):
+    with pytest.raises(ValueError, match="outside the frozen"):
+        coordinator(tmp_path, config, only_job=(45, 10000))
+
+
+def test_only_job_runs_both_benchmarks_exits_preserves_config_other_results_and_weights(tmp_path, config, monkeypatch):
+    f = prepared_checkpoint(tmp_path, config)
+    ignored = prepared_checkpoint(tmp_path, config, seed=43)
+    shutil.rmtree(ignored.source)  # irrelevant missing exports must not block this job
+    experiment = coordinator(tmp_path, config, only_job=periodic.parse_job("42:10000"))
+    write_json(experiment.root / "experiment_config.json", {"config": config})
+    signature = {"protocol_version": 1, "steps": list(periodic.STEPS), "seeds": [42, 43, 44],
+                 "benchmarks": periodic.EPISODES,
+                 "source_experiment_config_sha256": periodic.file_hash(experiment.root / "experiment_config.json"),
+                 "server_device": "cuda:6", "render_device": 7, "server_port": 18087, "eval_workers": 4}
+    write_json(experiment.output / "config.json", signature)
+    preserved = [experiment.output / "summary.json"] + [
+        experiment.output / f"seed{seed}/status.json" for seed in (42, 43, 44)]
+    for path in preserved:
+        write_json(path, {"existing": str(path)})
+    original = {path: path.read_bytes() for path in preserved}
+    completed = []
+    stopped = []
+    server = SimpleNamespace(stop=lambda: stopped.append(True))
+    monkeypatch.setattr(experiment, "start", lambda *args: server)
+    monkeypatch.setattr(experiment, "wait_for_server", lambda *args: None)
+    monkeypatch.setattr(periodic.time, "sleep", lambda seconds: pytest.fail("one-job run waited for other checkpoints"))
+
+    def evaluate(command, kind, log_path):
+        benchmark = command[command.index("--benchmark") + 1]
+        output = Path(command[command.index("--output") + 1])
+        info = experiment.infos[42, 10000]
+        artifacts.official_evaluation(output, benchmark, info)
+        completed.append(benchmark)
+
+    monkeypatch.setattr(experiment, "run_command", evaluate)
+    assert experiment.run() == 0
+    assert completed == ["libero", "libero_plus"]
+    assert stopped == [True]
+    assert set(experiment.infos) == set(experiment.reports) == {(42, 10000)}
+    assert json.loads((experiment.output / "config.json").read_text()) == signature
+    assert all(path.read_bytes() == original[path] for path in preserved)
+    job = experiment.job_directory(42, 10000)
+    assert (job / "checkpoint/weights.pt").read_bytes() == (f.source / "weights.pt").read_bytes()
+    receipt = json.loads((job / "verification.json").read_text())
+    assert receipt["weights_retained"] and "weights_released_at_unix" not in receipt
+    summary = json.loads((job / "run_summary.json").read_text())
+    assert summary["complete"] and summary["seed"] == 42 and summary["step"] == 10000
+    assert summary["results"]["requested_training_seeds"] == [42]
+    status = json.loads((experiment.output / "status.json").read_text())
+    assert status["status"] == "completed" and status["requested_jobs"] == status["completed_jobs"] == 1
+    assert status["only_job"] == {"seed": 42, "step": 10000}
+    assert status["awaiting_checkpoint_jobs"] == 0
+
+    # An already verified bounded rerun exits without launching a server or
+    # releasing its retained checkpoint, and does not duplicate score events.
+    events_before = [event for event in periodic.complete_events(experiment.output / "events.jsonl")
+                     if event["event"] == "evaluation_verified"]
+    resumed = coordinator(tmp_path, config, only_job=(42, 10000))
+    monkeypatch.setattr(resumed, "start", lambda *args: pytest.fail("completed job was reevaluated"))
+    assert resumed.run() == 0
+    assert (job / "checkpoint/weights.pt").is_file()
+    assert all(path.read_bytes() == original[path] for path in preserved)
+    assert [event for event in periodic.complete_events(experiment.output / "events.jsonl")
+            if event["event"] == "evaluation_verified"] == events_before
+
+
+def test_keep_weights_still_requires_verified_server_shutdown(captured_job, config):
+    f, info, reports, receipt = captured_job
+    experiment = coordinator(f.seed_output.parent.parent, config, keep_checkpoint_weights=True)
+    experiment.output = f.job.parents[1]
+    experiment.job_directory = lambda seed, step: f.job
+    write_json(f.job / "verification.json", {**receipt, "server_stopped": False})
+    with pytest.raises(RuntimeError, match="server shutdown"):
+        experiment.accept_completed_job(f.seed, f.step, info)
+    assert not experiment.reports
+    assert (f.destination / "weights.pt").is_file()

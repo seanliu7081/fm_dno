@@ -13,4 +13,6 @@ exec /workspace/venvs/starvla-heading/bin/python -u scripts/run_starvla_experime
   --config oat/config/starvla_heading_gaussian.yaml \
   --output-root output/starvla_heading_gaussian \
   --server-device cuda:0 --render-gpu-device-id 1 \
-  --eval-workers 4 --prune-completed-optimizer
+  --eval-workers 4 --parallel-eval-workers 20 \
+  --inference-devices cuda:0 cuda:2 cuda:3 cuda:4 cuda:5 \
+  --server-startup-timeout 1200 --prune-completed-optimizer

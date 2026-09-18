@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Sequence, Tuple
+from numbers import Integral
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -28,6 +29,7 @@ class SpatialTokenObservationEncoder(BaseObservationEncoder):
         crop_shape: Tuple[int, int] = (116, 116),
         token_dim: int = 256,
         task_ids: Sequence[int] = tuple(range(30, 40)),
+        state_keys: Optional[Sequence[str]] = None,
     ):
         super().__init__()
         if not isinstance(n_obs_steps, int) or n_obs_steps < 1:
@@ -45,12 +47,32 @@ class SpatialTokenObservationEncoder(BaseObservationEncoder):
             raise ValueError("crop_shape must contain two positive sizes")
         self.rgb_ports = [name for name, meta in shape_meta["obs"].items()
                           if meta.get("type") == "rgb"]
-        self.state_ports = ["robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"]
         if not self.rgb_ports:
             raise ValueError("Spatial observation encoding requires RGB observations")
-        for port, dimension in zip(self.state_ports, (3, 4, 2)):
-            if port not in shape_meta["obs"] or tuple(shape_meta["obs"][port]["shape"]) != (dimension,):
-                raise ValueError(f"{port} must have shape ({dimension},)")
+        if state_keys is None:
+            # Preserve the original LIBERO schema and checkpoint dimensions.
+            self.state_ports = ["robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"]
+            for port, dimension in zip(self.state_ports, (3, 4, 2)):
+                if port not in shape_meta["obs"] or tuple(shape_meta["obs"][port]["shape"]) != (dimension,):
+                    raise ValueError(f"{port} must have shape ({dimension},)")
+        else:
+            if isinstance(state_keys, (str, bytes)):
+                raise ValueError("state_keys must be a nonempty sequence of distinct observation names")
+            self.state_ports = list(state_keys)
+            if (not self.state_ports
+                    or any(not isinstance(port, str) or not port for port in self.state_ports)
+                    or len(set(self.state_ports)) != len(self.state_ports)):
+                raise ValueError("state_keys must be a nonempty sequence of distinct observation names")
+            for port in self.state_ports:
+                if port == "task_uid" or port in self.rgb_ports:
+                    raise ValueError(f"state_keys cannot include RGB or task_uid observations: {port}")
+                if port not in shape_meta["obs"]:
+                    raise ValueError(f"Unknown state observation: {port}")
+                shape = tuple(shape_meta["obs"][port].get("shape", ()))
+                if (len(shape) != 1 or not isinstance(shape[0], Integral)
+                        or isinstance(shape[0], bool) or shape[0] < 1):
+                    raise ValueError(f"State observation {port} must have a positive one-dimensional shape")
+        state_dim = sum(int(shape_meta["obs"][port]["shape"][0]) for port in self.state_ports)
         if "task_uid" not in shape_meta["obs"]:
             raise ValueError("A raw task_uid observation is required")
         self.image_shapes = {}
@@ -73,7 +95,7 @@ class SpatialTokenObservationEncoder(BaseObservationEncoder):
             )
             self.visual_trunks[port] = nn.Sequential(*list(trunk.children())[:-2])
             self.visual_projections[port] = nn.Sequential(nn.Linear(512, token_dim), nn.LayerNorm(token_dim))
-        self.state_projection = nn.Sequential(nn.Linear(9, token_dim), nn.LayerNorm(token_dim))
+        self.state_projection = nn.Sequential(nn.Linear(state_dim, token_dim), nn.LayerNorm(token_dim))
         self.camera_embedding = nn.Embedding(len(self.rgb_ports), token_dim)
         self.time_embedding = nn.Embedding(n_obs_steps, token_dim)
         self.type_embedding = nn.Embedding(3, token_dim)  # visual / state / task

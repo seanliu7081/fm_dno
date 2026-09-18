@@ -36,6 +36,13 @@ EPISODES = {"libero": 2000, "libero_plus": 10030}
 CHECKPOINT_FILES = ("weights.pt", "config.json", "dataset_manifest.json", "metadata.json")
 
 
+def parse_job(value):
+    match = re.fullmatch(r"(\d+):(\d+)", value)
+    if not match or int(match[2]) not in STEPS:
+        raise argparse.ArgumentTypeError("Expected SEED:STEP with STEP one of 10000, 20000, 30000")
+    return int(match[1]), int(match[2])
+
+
 def complete_events(path):
     """Ignore only an unfinished trailing append; malformed committed rows fail."""
     path = Path(path)
@@ -229,6 +236,16 @@ def record_verified_event(events_path, event):
     return True
 
 
+def validate_completion_receipt(job_directory, info):
+    receipt = read_json(Path(job_directory) / "verification.json")
+    metadata = info["metadata"]
+    if (receipt.get("status") != "completed" or receipt.get("server_stopped") is not True
+            or receipt.get("metadata") != metadata
+            or receipt.get("checkpoint_sha256") != metadata["checkpoint_sha256"]):
+        raise RuntimeError("Expected complete verification and server shutdown")
+    return receipt
+
+
 def release_snapshot_weights(job_directory, info, reports):
     """Release only an owned snapshot's weights after both verified evaluations."""
     job = Path(job_directory)
@@ -238,11 +255,7 @@ def release_snapshot_weights(job_directory, info, reports):
     metadata = info["metadata"]
     if job.name != f"step_{metadata['step']:08d}" or job.parent.name != f"seed{metadata['seed']}":
         raise RuntimeError("Refusing to release weights outside an exact seed/step job directory")
-    receipt = read_json(job / "verification.json")
-    if (receipt.get("status") != "completed" or receipt.get("server_stopped") is not True
-            or receipt.get("metadata") != metadata
-            or receipt.get("checkpoint_sha256") != metadata["checkpoint_sha256"]):
-        raise RuntimeError("Cannot release snapshot before complete verification and server shutdown")
+    receipt = validate_completion_receipt(job, info)
     for benchmark in EPISODES:
         verified = verify_evaluation(job / benchmark, benchmark, info)
         if verified is None or reports.get(benchmark) != verified:
@@ -265,6 +278,12 @@ class PeriodicExperiment:
         self.output = self.root / "periodic_evaluation"
         self.config = experiment["config"]
         self.seeds = list(self.config.get("seeds", [42, 43, 44]))
+        self.only_job = getattr(args, "only_job", None)
+        self.jobs = ([self.only_job] if self.only_job else
+                     [(seed, step) for seed in self.seeds for step in STEPS])
+        if any(seed not in self.seeds or step not in STEPS for seed, step in self.jobs):
+            raise ValueError("Requested job is outside the frozen periodic schedule")
+        self.keep_checkpoint_weights = bool(self.only_job or getattr(args, "keep_checkpoint_weights", False))
         self.children = []
         self.stopping = False
         self.infos, self.reports = {}, {}
@@ -297,9 +316,10 @@ class PeriodicExperiment:
                     "benchmark": self.current_benchmark} if self.current_job else None)
         write_json(self.output / "status.json", {"status": status, "phase": self.phase,
             "current_job": current, "seeds": self.seeds, "steps": list(STEPS),
-            "requested_jobs": len(self.seeds) * len(STEPS), "captured_jobs": len(self.infos),
+            "only_job": ({"seed": self.only_job[0], "step": self.only_job[1]} if self.only_job else None),
+            "requested_jobs": len(self.jobs), "captured_jobs": len(self.infos),
             "completed_jobs": len(self.reports), "queued_jobs": len([key for key in pending if key != self.current_job]),
-            "awaiting_checkpoint_jobs": len(self.seeds) * len(STEPS) - len(self.infos),
+            "awaiting_checkpoint_jobs": len(self.jobs) - len(self.infos),
             "free_disk_gib": shutil.disk_usage(self.root).free / 2**30,
             "observed_at_unix": time.time(), **fields})
 
@@ -307,29 +327,28 @@ class PeriodicExperiment:
         if not force and time.monotonic() - self.last_capture < self.args.poll_seconds:
             return
         self.last_capture = time.monotonic()
-        for seed in self.seeds:
+        for seed, step in self.jobs:
             source = self.root / f"seed{seed}"
-            for step in STEPS:
-                key = seed, step
-                if key in self.infos:
-                    continue
-                job = self.job_directory(seed, step)
-                try:
-                    info = capture_checkpoint(source, job / "checkpoint", seed, step,
-                                              seed_configuration(self.config, seed, source))
-                except Exception:
-                    self.failed_job = seed, step
-                    raise
-                if info is None:
-                    continue
-                self.infos[key] = info
-                self.event("checkpoint_captured", seed=seed, step=step, checkpoint=info["checkpoint"],
-                           checkpoint_sha256=info["metadata"]["checkpoint_sha256"])
-                verification = job / "verification.json"
-                if verification.is_file() and read_json(verification).get("status") == "completed":
-                    self.accept_completed_job(seed, step, info)
-                else:
-                    write_json(job / "status.json", {"status": "queued", "seed": seed, "step": step})
+            key = seed, step
+            if key in self.infos:
+                continue
+            job = self.job_directory(seed, step)
+            try:
+                info = capture_checkpoint(source, job / "checkpoint", seed, step,
+                                          seed_configuration(self.config, seed, source))
+            except Exception:
+                self.failed_job = seed, step
+                raise
+            if info is None:
+                continue
+            self.infos[key] = info
+            self.event("checkpoint_captured", seed=seed, step=step, checkpoint=info["checkpoint"],
+                       checkpoint_sha256=info["metadata"]["checkpoint_sha256"])
+            verification = job / "verification.json"
+            if verification.is_file() and read_json(verification).get("status") == "completed":
+                self.accept_completed_job(seed, step, info)
+            else:
+                write_json(job / "status.json", {"status": "queued", "seed": seed, "step": step})
         self.update_status()
 
     def verified_event(self, seed, step, benchmark, info, report):
@@ -342,7 +361,10 @@ class PeriodicExperiment:
         reports = {benchmark: verify_evaluation(job / benchmark, benchmark, info) for benchmark in EPISODES}
         if not all(report is not None for report in reports.values()):
             raise RuntimeError("Completed periodic job has incomplete official benchmark evidence")
-        release_snapshot_weights(job, info, reports)
+        if self.keep_checkpoint_weights:
+            validate_completion_receipt(job, info)
+        else:
+            release_snapshot_weights(job, info, reports)
         for benchmark, report in reports.items():
             self.verified_event(seed, step, benchmark, info, report)
         self.reports[seed, step] = reports
@@ -351,6 +373,18 @@ class PeriodicExperiment:
         self.update_summary()
 
     def update_summary(self):
+        if self.only_job:
+            seed, step = self.only_job
+            # A bounded rerun cannot replace aggregates for the frozen nine-job
+            # schedule with a summary containing only its selected checkpoint.
+            write_json(self.job_directory(seed, step) / "run_summary.json", {
+                "variant": "heading_gaussian", "seed": seed, "step": step,
+                "complete": self.only_job in self.reports,
+                "benchmarks": EPISODES,
+                "results": aggregate_results([seed], {
+                    seed: self.reports[self.only_job]} if self.only_job in self.reports else {}),
+                "selection_policy": "Reporting only; never used for checkpoint selection"})
+            return
         summaries = {str(step): aggregate_results(self.seeds, {
             seed: self.reports[seed, step] for seed in self.seeds if (seed, step) in self.reports}) for step in STEPS}
         write_json(self.output / "summary.json", {"variant": "heading_gaussian", "steps": list(STEPS),
@@ -449,6 +483,7 @@ class PeriodicExperiment:
         write_json(job / "verification.json", {"status": "completed", "seed": seed, "step": step,
                    "checkpoint_sha256": info["metadata"]["checkpoint_sha256"], "metadata": info["metadata"],
                    "server_stopped": True, "verified_at_unix": time.time(),
+                   "weights_retained": self.keep_checkpoint_weights,
                    "episodes": EPISODES, "selection_policy": "Reporting only; never used for checkpoint selection"})
         self.accept_completed_job(seed, step, info)
         self.event("job_completed", seed=seed, step=step, checkpoint_sha256=info["metadata"]["checkpoint_sha256"])
@@ -470,12 +505,14 @@ class PeriodicExperiment:
                 raise RuntimeError("Periodic evaluation settings changed; resume with the frozen configuration")
             write_json(config_path, signature)
             handlers = {sig: signal.signal(sig, self.on_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
-            self.event("periodic_evaluation_started", seeds=self.seeds, steps=list(STEPS))
+            self.event("periodic_evaluation_started", seeds=self.seeds, steps=list(STEPS),
+                       requested_jobs=[{"seed": seed, "step": step} for seed, step in self.jobs],
+                       keep_checkpoint_weights=self.keep_checkpoint_weights)
             self.update_status()
             try:
                 self.capture_due(force=True)
                 self.update_summary()
-                while len(self.reports) < len(self.seeds) * len(STEPS):
+                while len(self.reports) < len(self.jobs):
                     if self.stopping:
                         raise InterruptedExperiment("Periodic evaluation interrupted")
                     self.capture_due()
@@ -486,7 +523,8 @@ class PeriodicExperiment:
                         time.sleep(.5)
                 self.phase = "completed"
                 self.update_status("completed", completed_at_unix=time.time())
-                self.event("periodic_evaluation_completed", seeds=self.seeds, steps=list(STEPS))
+                self.event("periodic_evaluation_completed", seeds=self.seeds, steps=list(STEPS),
+                           completed_jobs=[{"seed": seed, "step": step} for seed, step in self.jobs])
                 return 0
             except Exception as error:
                 status = "interrupted" if isinstance(error, InterruptedExperiment) else "failed"
@@ -495,7 +533,8 @@ class PeriodicExperiment:
                 for key in {self.current_job, self.failed_job} - {None}:
                     seed, step = key
                     write_json(self.job_directory(seed, step) / "status.json", {**fields, "seed": seed, "step": step})
-                    write_json(self.output / f"seed{seed}" / "status.json", {**fields, "seed": seed})
+                    if not self.only_job:
+                        write_json(self.output / f"seed{seed}" / "status.json", {**fields, "seed": seed})
                 self.event("periodic_evaluation_stopped", **fields)
                 return 130 if isinstance(error, InterruptedExperiment) else 1
             finally:
@@ -514,9 +553,15 @@ def main(argv=None):
     parser.add_argument("--eval-workers", type=int, default=4)
     parser.add_argument("--poll-seconds", type=float, default=10)
     parser.add_argument("--server-startup-timeout", type=float, default=600)
+    parser.add_argument("--only-job", type=parse_job, metavar="SEED:STEP",
+                        help="Evaluate only this frozen-schedule job, retain its weights, and exit")
+    parser.add_argument("--keep-checkpoint-weights", action="store_true",
+                        help="Retain verified checkpoint snapshots after both benchmarks finish")
     args = parser.parse_args(argv)
     args.output_root = args.output_root.resolve()
     experiment = read_json(args.output_root / "experiment_config.json")
+    if args.only_job and args.only_job[0] not in experiment["config"].get("seeds", [42, 43, 44]):
+        parser.error("Requested seed is outside the frozen periodic schedule")
     match = re.fullmatch(r"cuda:(\d+)", args.server_device)
     if not match or args.render_gpu_device_id < 0 or args.eval_workers < 1:
         parser.error("Expected cuda:N, a nonnegative render GPU, and positive worker count")
