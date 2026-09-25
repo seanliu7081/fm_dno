@@ -1,0 +1,63 @@
+# Separate 56M spatial-motion experiment; existing configurations are untouched.
+defaults:
+  - train_flowpolicy_spatial_motion_dit
+  - override task/policy: real_robot/nut_washer_v3_spatial_motion
+  - _self_
+
+name: train_DiTL_nut_washer_v3
+_target_: oat.workspace.train_policy.TrainPolicyWorkspace
+
+policy:
+  embed_dim: 512
+  n_layers: 8
+  n_heads: 8
+  obs_encoder:
+    crop_shape: [116, 116]
+    token_dim: 256
+    task_ids: [0]
+    state_keys: [robot0_eef_pos, robot0_eef_rot6d, robot0_gripper_qpos]
+
+training:
+  num_demo: 77
+  num_epochs: 500
+  resume: false
+  # Existing trainer uses zero-based epoch IDs: saves after 1, 51, 101, ... epochs.
+  checkpoint_every: 50
+  val_every: 10
+  sample_every: 50
+  validation_epoch_offset: 1
+  sample_epoch_offset: 1
+  max_reconst_steps: 10
+  tqdm_interval_sec: 10.0
+
+val_dataloader:
+  batch_size: 32
+  drop_last: false
+
+logging:
+  project: real_robot
+  name: ${name}_${now:%Y%m%d.%H%M%S}_seed${seed}
+  mode: online
+  resume: false
+  group: train_DiTL_nut_washer_v3
+  tags: [real_robot, nut_washer_v3_N77, spatial_tokens, motion_queries, dit, 56m, scratch]
+
+checkpoint:
+  topk:
+    # Retain every scheduled archive, independent of validation availability.
+    monitor_key: completed_epochs
+    mode: max
+    k: ${eval:'(${training.num_epochs} - 1) // ${training.checkpoint_every} + 2'}
+    format_str: 'epoch-{completed_epochs:04d}.ckpt'
+  save_last_ckpt: true
+  save_last_snapshot: false
+  save_rollout_ckpt: false
+  save_final_ckpt: true
+  save_before_rollout: false
+
+hydra:
+  run:
+    dir: output/train_DiTL_nut_washer_v3/${now:%Y%m%dT%H%M%S}_seed${seed}
+
+metrics:
+  log_eval_videos: false

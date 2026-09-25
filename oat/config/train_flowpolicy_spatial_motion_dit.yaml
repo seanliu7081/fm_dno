@@ -39,9 +39,12 @@ policy:
   backbone_kwargs:
     num_register_tokens: 32
     add_cond_pos_emb: false
-  embed_dim: 256
-  n_layers: 4
-  n_heads: 4
+  # embed_dim: 256
+  # n_layers: 4
+  # n_heads: 4
+  embed_dim: 512
+  n_layers: 8
+  n_heads: 8
   dropout: 0.0
   num_inference_steps: 10
   inference_bf16: true

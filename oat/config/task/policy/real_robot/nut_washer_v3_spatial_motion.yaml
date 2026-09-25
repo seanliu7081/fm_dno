@@ -1,0 +1,52 @@
+# Nut/washer V3 demonstrations with native real-robot state observations.
+name: real_robot_nut_washer_v3_N77
+task_name: nut_washer_v3_N77
+task_uids: [0]
+lazy_eval: true
+distributed_eval: false
+fps: 30
+
+shape_meta:
+  obs:
+    agentview_rgb:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_eye_in_hand_rgb:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_eef_pos:
+      shape: [3]
+      type: state
+    robot0_eef_rot6d:
+      shape: [6]
+      type: state
+    robot0_gripper_qpos:
+      shape: [1]
+      type: state
+    task_uid:
+      shape: [1]
+      type: state
+  action:
+    shape: [7]
+
+# Held-out demonstrations are evaluated; no simulator or robot is controlled.
+env_runner:
+  fps: 30
+
+dataset:
+  _target_: oat.dataset.motion_plan_zarr_dataset.MotionPlanZarrDataset
+  zarr_path: /workspace/ysk/zarr/nut_washer_v3_N77.zarr
+  obs_keys:
+    - agentview_rgb
+    - robot0_eye_in_hand_rgb
+    - robot0_eef_pos
+    - robot0_eef_rot6d
+    - robot0_gripper_qpos
+    - task_uid
+  rgb_keys: [agentview_rgb, robot0_eye_in_hand_rgb]
+  action_key: action
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${horizon}
+  seed: ${seed}
+  val_ratio: 0.1
+  max_train_episodes: null
