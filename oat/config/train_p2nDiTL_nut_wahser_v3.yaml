@@ -1,0 +1,41 @@
+# Exact user-requested experiment name; the dataset is still nut_washer_v3_N77.
+defaults:
+  - train_DiTL_nut_washer_v3
+  - _self_
+
+name: train_p2nDiTL_nut_wahser_v3
+past_n: 7
+
+policy:
+  _target_: oat.policy.flow_policy_spatial_motion_self_past.SpatialMotionSelfPastFlowPolicy
+  past_n: ${past_n}
+  # Ground-truth warmup, then increase generated-history probability to 1.
+  # Counts are successful optimizer updates, preserved in model/EMA checkpoints.
+  self_past_p: 1.0
+  self_past_warmup_steps: 500
+  self_past_ramp_steps: 2000
+
+# Preserve the original train-only normalizer/RMS and current action masks.
+task:
+  policy:
+    dataset:
+      _target_: oat.dataset.spatial_motion_self_past_dataset.SpatialMotionSelfPastDataset
+      past_n: ${past_n}
+      n_exec_steps: ${n_action_steps}
+
+ema:
+  _target_: oat.model.diffusion.ema_self_past.SelfPastEMAModel
+
+logging:
+  project: real_robot
+  mode: online
+  name: ${name}_${now:%Y%m%d.%H%M%S}_seed${seed}
+  group: train_p2nDiTL_nut_wahser_v3
+  tags: [real_robot, nut_washer_v3_N77, spatial_tokens, motion_queries, dit, self_past, scratch]
+
+# Existing validation/reconstruction consume explicit per-sample history via
+# obs._p2n_context. Both evaluate depth-one generated history at probability 1;
+# they never reuse online rollout buffers or advance the training curriculum.
+hydra:
+  run:
+    dir: output/train_p2nDiTL_nut_wahser_v3/${now:%Y%m%dT%H%M%S}_seed${seed}
